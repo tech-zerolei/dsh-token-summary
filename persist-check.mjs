@@ -50,7 +50,7 @@ const session = {
 };
 
 apply(ctx, { intervalTokens: 10, outputDir: out, notifyInSession: true });
-ctx._h(session, { type: 'assistant/message', data: { usage: { totalTokens: 15 } } });
+ctx._h(session, { type: 'assistant/message', data: { usage: { inputTokens: 12, outputTokens: 3 } } });
 await new Promise((r) => setTimeout(r, 200));
 
 if (captured.length === 0) {

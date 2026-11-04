@@ -37,7 +37,7 @@ const session = {
 };
 apply(ctx, { intervalTokens: 10, outputDir: dir, notifyInSession: false });
 for (const h of listeners.get('session/event') ?? []) {
-  h(session, { type: 'assistant/message', data: { usage: { totalTokens: 15 } } });
+  h(session, { type: 'assistant/message', data: { usage: { inputTokens: 12, outputTokens: 3 } } });
 }
 await new Promise((r) => setTimeout(r, 300));
 // Report the observation, let the parent decide what it means.
@@ -59,13 +59,13 @@ const run = (label, env) =>
 
 // 1) 次级进程：必须完全不归档，也不能调用模型
 const sec = await run('secondary', { [MARKER]: '1' });
-const secFiles = (await readdir(sec.dir).catch(() => [])).filter((f) => f.startsWith('summary-'));
+const secFiles = (await readdir(sec.dir).catch(() => [])).filter((f) => f.startsWith('handoff-'));
 if (sec.code === 1) throw new Error('secondary process called the model; it must stand down');
 if (secFiles.length !== 0) throw new Error(`secondary process filed archives: ${secFiles.join(', ')}`);
 
 // 2) 主进程：不带标记时必须正常归档，证明停摆是标记导致的而非逻辑坏了
 const pri = await run('primary', {});
-const priFiles = (await readdir(pri.dir).catch(() => [])).filter((f) => f.startsWith('summary-'));
+const priFiles = (await readdir(pri.dir).catch(() => [])).filter((f) => f.startsWith('handoff-'));
 if (pri.code !== 1) throw new Error(`primary process must call the model, exit ${pri.code}: ${pri.err.slice(0, 200)}`);
 if (priFiles.length !== 1) throw new Error(`primary must file exactly one archive, got ${priFiles.join(', ')}`);
 

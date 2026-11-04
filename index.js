@@ -19,7 +19,7 @@
  * @module dsh-token-summary
  */
 
-import { appendFile, mkdir, open, readdir, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, open, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import {
   buildNotice,
@@ -141,6 +141,93 @@ export function apply(ctx, rawConfig) {
   let batch = 0;
   /** Serializes boundary handling so two sessions never write the same batch. */
   let queue = Promise.resolve();
+  /**
+   * Read the most recent handoff document for a session, to extend it.
+   *
+   * The deliverable is cumulative: each new handoff merges into the previous one
+   * so the reader gets one coherent, ever-longer document. Reading it back from
+   * disk keeps that state durable — the plugin holds no private copy, and a
+   * restart resumes from whatever is already written.
+   *
+   * @param dir - output directory holding the previous handoff.
+   * @returns the document body, or `undefined` when this is the first handoff.
+   */
+  /**
+   * How many of the session's events the previous handoff already covered.
+   *
+   * Recorded in the document itself so a restarted process can resume exactly
+   * where the last one stopped, instead of re-sending history or guessing.
+   *
+   * @param body - the previous document's full text.
+   * @returns the covered event count, or 0 when it is not recorded.
+   */
+  const coveredBy = (body) => {
+    const match = /\| 已覆盖事件数 \| (\d+) \|/.exec(body ?? '');
+    return match === null ? 0 : Number(match[1]);
+  };
+
+  const readLatestDocument = async (dir, sessionTag) => {
+    if (dir === undefined) return undefined;
+    try {
+      // Only this session's documents. Picking the newest file in a shared
+      // directory made a session merge another session's handoff into its own,
+      // corrupting both with content from a conversation the reader never had.
+      // Match on the stable identity suffix, not the readable title: the title
+      // may have changed since the previous handoff was written.
+      const identity = `--${sessionTag.split('--').pop()}-`;
+      const entries = (await readdir(dir))
+        .filter((f) => f.startsWith('handoff-') && f.includes(identity) && /\.md$/.test(f))
+        .sort();
+      if (entries.length === 0) return undefined;
+      const body = await readFile(join(dir, entries[entries.length - 1]), 'utf8');
+      // Strip the generated front matter and footer so the model sees only the
+      // document itself, not our bookkeeping.
+      const start = body.indexOf('## 交接正文');
+      const end = body.lastIndexOf('\n---\n');
+      const text = start === -1 ? body : body.slice(start + '## 交接正文'.length, end === -1 ? undefined : end).trim();
+      return { text, raw: body };
+    } catch {
+      return undefined;
+    }
+  };
+
+  /**
+   * A filesystem-safe, human-readable tag for one session.
+   *
+   * Used in handoff file names so a session can find its OWN previous document
+   * in a directory shared by every session. Session ids are already safe on this
+   * platform, but they are sanitised anyway: this string becomes a path segment.
+   *
+   * @param session - session whose document is being named.
+   * @returns a short tag unique to the session.
+   */
+  const sessionTagOf = (session) => {
+    const raw = String(session.id);
+    // A hash keeps ids distinct even when they share a tail.
+    // 32-bit FNV-1a: stable across restarts and cheap. Base36 keeps it short but
+    // with enough width (6 chars ≈ 2.1e9 values) that two sessions sharing a
+    // directory will not collide in practice.
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < raw.length; i += 1) {
+      hash ^= raw.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    const suffix = hash.toString(36).padStart(6, '0').slice(-6);
+    // Prefer a readable title, so a directory holding several sessions can be
+    // told apart at a glance; fall back to the id when there is no title.
+    const title = titleOf(session);
+    const slug = typeof title === 'string'
+      ? title.replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 24)
+      : '';
+    // The title is decoration only: it can change mid-session (auto-generated
+    // titles get refined), so lookup must key on the stable hash below. Tag
+    // format: <slug|id-fragment>--<hash>. The double dash separates the readable
+    // part from the identity part.
+    if (slug !== '') return `${slug}--${suffix}`;
+    const cleaned = raw.replace(/[^A-Za-z0-9_-]/g, '');
+    return cleaned === '' ? `session--${suffix}` : `${cleaned.slice(0, 6)}--${suffix}`;
+  };
+
   /** Commit the resume point for one session after its report is durable. */
   const commitCursor = (sessionId, upTo) => {
     if (upTo === undefined) return;
@@ -202,7 +289,7 @@ export function apply(ctx, rawConfig) {
    * @param route - resolved provider/model route, or `undefined`.
    * @returns the summary text and, when the call failed, the failure reason.
    */
-  const summarize = async (session, transcript, route) => {
+  const summarize = async (session, transcript, route, previousDocument) => {
     if (route === undefined) {
       return {
         text: '',
@@ -212,12 +299,21 @@ export function apply(ctx, rawConfig) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), config.timeoutMs);
     try {
-      const prompt = buildPrompt(transcript.text === '' ? '（这一段没有可读的对话文本）' : transcript.text);
+      const prompt = buildPrompt(
+        transcript.text === '' ? '（这一段没有可读的对话文本）' : transcript.text,
+        previousDocument,
+      );
       const stream = ctx.llm.stream({
         provider: route.provider,
         model: route.model,
         messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
         maxTokens: config.maxSummaryOutputTokens,
+        // Handoff writing is a transcription task, not a reasoning task. On
+        // reasoning models the hidden reasoning tokens are billed against the
+        // same output budget, so a high effort can consume most of it and cut
+        // the document off mid-sentence (observed: 1,157 reasoning chars for a
+        // 211-char body). A low effort keeps the budget for the document itself.
+        ...(config.reasoningEffort === '' ? {} : { reasoningEffort: config.reasoningEffort }),
         sessionId: session.id,
         signal: controller.signal,
       });
@@ -268,7 +364,19 @@ export function apply(ctx, rawConfig) {
     await mkdir(dir, { recursive: true }).catch(() => {});
     try {
       for (const entry of await readdir(dir)) {
-        const match = /^summary-(\d+)-/.exec(entry);
+        // Ordinals are global within the directory: every handoff there shares
+        // one numbering space, so the timeline is unambiguous no matter which
+        // session produced the file. Both shapes are accepted — with and without
+        // the session tag — so archives written by older versions still count.
+        // Match the ordinal positionally instead of letting an optional tag
+        // swallow it: a greedy `(?:[\w-]+-)?` happily ate a tag ending in digits
+        // and produced ordinals like 2027. The ordinal is always a 4+ digit run
+        // immediately followed by `-<boundary>-<timestamp>.md`.
+        // The name is `handoff-<readable>--<hash>-<ordinal>-<boundary>-<stamp>.md`,
+        // where <readable> may hold any script (a session title) and `--` marks
+        // the boundary to the identity part. Anchor on the invariant tail rather
+        // than trying to describe the prefix.
+        const match = /-(\d{4,})-(\d+)-[\dTZ:.-]+\.md$/.exec(entry);
         if (match === null) continue;
         const seen = Number(match[1]);
         if (Number.isSafeInteger(seen) && seen >= candidate) candidate = seen + 1;
@@ -312,21 +420,63 @@ export function apply(ctx, rawConfig) {
    */
   const prepareSummary = async (session) => {
     const agent = agentOf(session);
-    // Incremental by default: only the events produced since the previous
-    // archive of *this* session. Summarizing the whole history again would make
-    // every file a near-copy of the one before it once the interval is small
-    // (at a 256K interval, the fifth file is ~80% identical to the fourth).
+    // First handoff summarizes the WHOLE conversation, because there is nothing
+    // to build on yet and the reader needs the full picture. Later handoffs only
+    // fold in the span produced since the last one, and merge it into the
+    // document that already exists — that is what makes the artifact a growing,
+    // resumable handoff document instead of a pile of disjoint slices.
     const events = session.ownEvents();
     const since = sessionCursor.get(session.id) ?? 0;
-    const fresh = events.slice(since);
+    const dir = outputDirFor(session, agent);
+    // "Is this the first handoff?" is a property of the ARCHIVE, not of this
+    // process. Keying it off the in-memory cursor meant a restart (cursor back at
+    // 0) re-summarized the entire history as if nothing had been written, and
+    // dropped the link to the document already on disk.
+    const previous = await readLatestDocument(dir, sessionTagOf(session));
+    const isFirst = previous === undefined;
+    const coveredByPrevious = isFirst ? 0 : coveredBy(previous?.raw);
+    // The span to summarize:
+    //  - first handoff        → the whole conversation
+    //  - later, cursor known  → exactly what appeared since the last handoff
+    //  - later, cursor lost   → the whole conversation MINUS what the previous
+    //                           document already covers. The cursor only lives in
+    //                           memory, so a restart loses it; guessing "the last
+    //                           event" produced a one-event span that was usually
+    //                           an assistant usage record with no text, and the
+    //                           resulting empty document repeated every few
+    //                           seconds because the boundary never advanced.
+    let fresh = isFirst
+      ? events
+      : events.slice(since > 0 ? since : Math.max(0, events.length - coveredByPrevious));
     // Never archive a span with nothing readable in it: if the gate opened on a
     // turn that produced no new messages, wait for the next one instead of
     // filing an empty report.
-    const transcript = buildTranscript(fresh, { maxChars: config.maxTranscriptChars });
+    let transcript = buildTranscript(fresh, { maxChars: config.maxTranscriptChars });
     // Nothing new to say: do not file an empty report and do not advance the
     // cursor (there is nothing to skip past). The caller checks `empty`.
-    if (transcript.text === '' && fresh.length === 0) {
-      return { empty: true, agent, transcript, route: undefined, summaryText: '', summaryFailure: undefined, truncated: false, sessionTitle: titleOf(session) };
+    // The test is "is there anything readable", not "are there any events": a
+    // span made only of tool calls has events but no text, and filing a report
+    // for it produced empty documents (0 user messages, 0 transcript chars) that
+    // repeated every few seconds because the boundary never advanced.
+    // A trailing span can be nothing but usage/bookkeeping events, which carry no
+    // readable text. Widen the window backwards until some text appears (or the
+    // whole log is exhausted) instead of filing an empty document.
+    if (transcript.text === '' && fresh.length > 0 && fresh.length < events.length) {
+      fresh = events;
+      transcript = buildTranscript(fresh, { maxChars: config.maxTranscriptChars });
+    }
+    if (transcript.text === '') {
+      return {
+        empty: true,
+        upTo: events.length,
+        agent,
+        transcript,
+        route: undefined,
+        summaryText: '',
+        summaryFailure: undefined,
+        truncated: false,
+        sessionTitle: titleOf(session),
+      };
     }
     // The cursor is NOT advanced here. It may only move once the report is on
     // disk: consuming the span before the write commits would discard that
@@ -334,10 +484,11 @@ export function apply(ctx, rawConfig) {
     // The caller commits it through `commitCursor` on success.
     const upTo = events.length;
     const route = resolveRoute(config, session, agent);
-    const { text: summaryText, failure: summaryFailure, truncated } = await summarize(session, transcript, route);
+    const { text: summaryText, failure: summaryFailure, truncated } =
+      await summarize(session, transcript, route, previous?.text);
     // Snapshot the title once so every boundary in this crossing agrees.
     const sessionTitle = titleOf(session);
-    return { agent, transcript, route, summaryText, summaryFailure, truncated, sessionTitle, upTo };
+    return { agent, transcript, route, summaryText, summaryFailure, truncated, sessionTitle, upTo, isFirst };
   };
 
   /**
@@ -357,7 +508,11 @@ export function apply(ctx, rawConfig) {
     // in this process cannot reserve the same number either.
     const { ordinal, claimPath } = await nextOrdinal(dir);
     const stamp = new Date(finishedAt).toISOString().replace(/[:.]/g, '-');
-    const fileName = `summary-${String(ordinal).padStart(4, '0')}-${boundary}-${stamp}.md`;
+    // The session id is part of the name, not just the front matter: several
+    // sessions share one output directory, and the next handoff has to find ITS
+    // own previous document instead of whichever file happens to be newest.
+    const sessionTag = sessionTagOf(session);
+    const fileName = `handoff-${sessionTag}-${String(ordinal).padStart(4, '0')}-${boundary}-${stamp}.md`;
     const filePath = join(dir, fileName);
     const markdown = renderMarkdown({
       batch: ordinal,
@@ -375,6 +530,7 @@ export function apply(ctx, rawConfig) {
       truncated,
       transcriptChars: transcript.chars,
       spanned,
+      coveredEvents: shared?.upTo,
     });
 
     let failure = summaryFailure;
@@ -405,7 +561,7 @@ export function apply(ctx, rawConfig) {
         try {
           const handle = await open(headerMarker, 'wx');
           await handle.close();
-          await appendFile(index, `${indexHeader(dir)}\n`, 'utf8');
+          await appendFile(index, indexHeader(dir), 'utf8');
         } catch (error) {
           // EEXIST: the header already exists, which is the normal case.
           if (error?.code !== 'EEXIST') throw error;
@@ -431,16 +587,16 @@ export function apply(ctx, rawConfig) {
    * @returns the Markdown preamble.
    */
   const indexHeader = (dir) => [
-    '# 会话总结索引',
+    '# 工程交接文档索引',
     '',
-    '由 `dsh-token-summary` 自动维护：进程内累计 token 每跨过一个批次就归档一份 Markdown 总结。',
+    '由 `dsh-token-summary` 自动维护：累计新增 token 每跨过一个阈值，就把会话整理成一份',
+    '可交给另一个 Agent 接着干的长文档。每份都在前一份基础上合并新增内容，越往后越完整。',
     '',
     `输出目录：\`${dir}\``,
     '',
     '## 归档记录',
     '',
-    '',
-  ].join('\n');
+  ].join('\n') + '\n';
 
   /**
    * Leave one durable, producer-attributed notice in the session.
@@ -488,9 +644,20 @@ export function apply(ctx, rawConfig) {
     // report is durably written, then the cursor advances.
     const boundaries = [];
     let cursor = nextThreshold;
-    while (totalTokens >= cursor) {
+    // Cap the walk. A single absurd usage figure (a corrupt or hostile provider
+    // report) would otherwise push millions of entries and crash the process with
+    // "Invalid array length" — observed with MAX_SAFE_INTEGER. Only the first and
+    // last boundary actually matter, so the span is what gets reported.
+    const MAX_BOUNDARIES = 1000;
+    while (totalTokens >= cursor && boundaries.length < MAX_BOUNDARIES) {
       boundaries.push(cursor);
       cursor += config.intervalTokens;
+    }
+    if (boundaries.length >= MAX_BOUNDARIES) {
+      logger.warn(
+        `单次用量异常巨大（累计 ${formatNumber(totalTokens)}），批次边界已截断至 ${MAX_BOUNDARIES} 个`,
+      );
+      cursor = totalTokens + config.intervalTokens;
     }
     queue = queue
       .then(async () => {
@@ -502,7 +669,13 @@ export function apply(ctx, rawConfig) {
         // pending so the next turn that does produce content fills them, rather
         // than filing empty reports or silently skipping the span.
         if (shared?.empty === true) {
-          logger.debug(`第 ${boundaries[0]} 批：自上次归档后无新内容，推迟到下个批次`);
+          // Nothing readable in this span. Advance past it: leaving the boundary
+          // pending made the same threshold fire again on the very next event,
+          // which produced a stream of identical empty documents.
+          logger.debug(`第 ${boundaries[0]} 批：该区间无对话文本，跳过并推进到下一区间`);
+          commitCursor(session.id, shared.upTo);
+          const beyond = boundaries[boundaries.length - 1] + config.intervalTokens;
+          if (beyond > nextThreshold) nextThreshold = beyond;
           return;
         }
         // One crossing produces exactly ONE report, spanning every boundary it
@@ -553,7 +726,12 @@ export function apply(ctx, rawConfig) {
     if (totalTokens >= nextThreshold) onThreshold(session);
   });
 
+  // Say where the files go at startup: an empty `outputDir` writes next to each
+  // session's working directory, which is easy to look for in the wrong place.
+  const destination = config.outputDir === ''
+    ? '每个会话的工作目录下 .dsh-summaries/'
+    : config.outputDir;
   logger.info(
-    `全局累计，每 ${formatNumber(config.intervalTokens)} token 归档一份 Markdown 总结`,
+    `每累计 ${formatNumber(config.intervalTokens)} 新增 token 生成一份交接文档 → ${destination}`,
   );
 }

@@ -66,7 +66,7 @@ function makeContext() {
 function makeSession(id, cwd) {
   const events = [
     { type: 'user/message', seq: 1, time: 1, data: { content: [{ type: 'text', text: '给我做一个 token 总结插件' }] } },
-    { type: 'assistant/message', seq: 2, time: 2, data: { message: { content: [{ type: 'text', text: '先看现有插件结构。' }] }, usage: { totalTokens: 40 } } },
+    { type: 'assistant/message', seq: 2, time: 2, data: { message: { content: [{ type: 'text', text: '先看现有插件结构。' }] }, usage: { inputTokens: 30, outputTokens: 10 } } },
     { type: 'tool/call', seq: 3, time: 3, data: { name: 'bash', arguments: '{}' } },
   ];
   return {
@@ -82,7 +82,7 @@ function makeSession(id, cwd) {
     appendTurn: (text) => {
       const seq = events.length + 1;
       events.push({ type: 'user/message', seq, time: seq, data: { content: [{ type: 'text', text }] } });
-      events.push({ type: 'assistant/message', seq: seq + 1, time: seq + 1, data: { message: { content: [{ type: 'text', text: `回应：${text}` }] }, usage: { totalTokens: 10 } } });
+      events.push({ type: 'assistant/message', seq: seq + 1, time: seq + 1, data: { message: { content: [{ type: 'text', text: `回应：${text}` }] }, usage: { inputTokens: 8, outputTokens: 2 } } });
     },
     requestHeader: () => ({ config: { provider: 'dp', model: 'deepseek-v4.1-flash-1017' } }),
   };
@@ -97,15 +97,15 @@ apply(host.ctx, { intervalTokens: 100, outputDir: outdir, maxTranscriptChars: 50
 
 assert.equal(name, 'token-summary');
 assert.deepEqual(inject, ['llm']);
-assert.ok(host.logs.some(([, m]) => /全局累计/.test(m)), 'activation logs the batch size');
+assert.ok(host.logs.some(([, m]) => /每累计 .* 新增 token/.test(m)), "activation logs the batch size and destination");
 
 // Below the threshold: nothing fires.
-host.emit({ type: 'assistant/message', data: { usage: { totalTokens: 60 } } }, session);
+host.emit({ type: 'assistant/message', data: { usage: { inputTokens: 60, outputTokens: 0 } } }, session);
 await new Promise((r) => setTimeout(r, 30));
 assert.equal(host.injectedAgents.length, 1, 'no notice below the threshold');
 
 // Crossing it: the model is asked once, a file appears, a notice is injected.
-host.emit({ type: 'assistant/message', data: { usage: { totalTokens: 60 } } }, session);
+host.emit({ type: 'assistant/message', data: { usage: { inputTokens: 60, outputTokens: 0 } } }, session);
 await new Promise((r) => setTimeout(r, 120));
 
 assert.equal(host.llmCalls.length, 1, 'exactly one summary call');
@@ -113,40 +113,40 @@ const call = host.llmCalls[0];
 assert.equal(call.provider, 'dp');
 assert.equal(call.model, 'deepseek-v4.1-flash-1017');
 assert.equal(call.sessionId, 'session-e2e');
-assert.match(call.messages[0].content[0].text, /会话归档员/);
+assert.match(call.messages[0].content[0].text, /交接文档/);
 assert.ok(call.messages[0].content[0].text.includes('给我做一个 token 总结插件'));
 assert.equal(host.injectedAgents.length, 2, 'one notice injected');
 const notice = host.injectedAgents[1];
 assert.equal(notice.source.kind, 'token-summary');
 assert.equal(notice.source.form, 'notice');
 assert.ok([...notice.source.summary].length <= 120);
-assert.match(notice.content[0].text, /第 1 批/);
+assert.match(notice.content[0].text, /第 1 版/);
 
 const files = await readdir(outdir);
-const batchFile = files.find((f) => f.startsWith('summary-0001-'));
+const batchFile = files.find((f) => /^handoff-.*?-0001-\d+-/.test(f));
 assert.ok(batchFile, `batch file written, got ${files.join(', ')}`);
 const markdown = await readFile(join(outdir, batchFile), 'utf8');
-assert.match(markdown, /^# 会话总结 · 第 1 批/);
+assert.match(markdown, /^# 工程交接文档 · 第 1 版/);
 assert.match(markdown, /完成一个插件的交付。/);
 assert.match(markdown, /演示会话/);
 assert.match(markdown, /dp \/ deepseek-v4\.1-flash-1017/);
 
 const index = await readFile(join(outdir, 'README.md'), 'utf8');
-assert.match(index, /^# 会话总结索引/);
-assert.match(index, /第 1 批/);
+assert.match(index, /^# 工程交接文档索引/);
+assert.match(index, /第 1 版/);
 assert.ok(index.includes(batchFile), 'index links the batch file');
 
 // A second crossing writes a second, separately named batch and appends to the index.
 session.appendTurn('第二轮的进展：插件已能落盘。');
-host.emit({ type: 'assistant/message', data: { usage: { totalTokens: 120 } } }, session);
+host.emit({ type: 'assistant/message', data: { usage: { inputTokens: 120, outputTokens: 0 } } }, session);
 await new Promise((r) => setTimeout(r, 150));
 const files2 = await readdir(outdir);
-const batches = files2.filter((f) => f.startsWith('summary-'));
+const batches = files2.filter((f) => f.startsWith('handoff-'));
 assert.equal(batches.length, 2, `two batches, got ${batches.join(', ')}`);
 assert.equal(host.llmCalls.length, 2);
 const index2 = await readFile(join(outdir, 'README.md'), 'utf8');
-assert.equal((index2.match(/# 会话总结索引/g) ?? []).length, 1, 'the index header is written once');
-assert.equal((index2.match(/第 [12] 批/g) ?? []).length, 2, 'both batches are indexed');
+assert.equal((index2.match(/# 工程交接文档索引/g) ?? []).length, 1, "the index header is written once");
+assert.equal((index2.match(/第 [12] 版/g) ?? []).length, 2, 'both batches are indexed');
 
 // A failing model call still produces a file, with a failure banner.
 const failing = makeContext();
@@ -159,11 +159,11 @@ failing.ctx.llm.stream = () => (async function* () {
 // would otherwise collide with the ISO timestamp embedded in the filename.
 const failDir = join(outdir, 'fail');
 apply(failing.ctx, { intervalTokens: 10, outputDir: failDir, notifyInSession: true });
-failing.emit({ type: 'assistant/message', data: { usage: { totalTokens: 25 } } }, session2);
+failing.emit({ type: 'assistant/message', data: { usage: { inputTokens: 25, outputTokens: 0 } } }, session2);
 await new Promise((r) => setTimeout(r, 150));
 // 25 tokens cross both the 10 and the 20 boundary. One crossing files exactly
 // ONE report spanning both, recording the span in its range and 跨越区间数.
-const failFiles = (await readdir(failDir)).filter((f) => f.startsWith('summary-'));
+const failFiles = (await readdir(failDir)).filter((f) => f.startsWith('handoff-'));
 assert.equal(failFiles.length, 1, `one crossing, one report, got ${failFiles.join(', ')}`);
 const failFile = failFiles[0];
 const failMd = await readFile(join(failDir, failFile), 'utf8');
@@ -179,10 +179,10 @@ session3.requestHeader = () => undefined;
 unrouted.injectedAgents.push({ id: 'session-noroute', inject: (m) => unrouted.injectedAgents.push(m) });
 const unroutedDir = join(outdir, 'unrouted');
 apply(unrouted.ctx, { intervalTokens: 10, outputDir: unroutedDir });
-unrouted.emit({ type: 'assistant/message', data: { usage: { totalTokens: 12 } } }, session3);
+unrouted.emit({ type: 'assistant/message', data: { usage: { inputTokens: 12, outputTokens: 0 } } }, session3);
 await new Promise((r) => setTimeout(r, 120));
 assert.equal(unrouted.llmCalls.length, 0, 'no model call without a route');
-const unroutedFiles = (await readdir(unroutedDir)).filter((f) => f.startsWith('summary-'));
+const unroutedFiles = (await readdir(unroutedDir)).filter((f) => f.startsWith('handoff-'));
 assert.equal(unroutedFiles.length, 1, `one report, got ${unroutedFiles.join(', ')}`);
 const unroutedReport = await readFile(join(unroutedDir, unroutedFiles[0]), 'utf8');
 assert.match(unroutedReport, /无法确定摘要路由/);
@@ -195,20 +195,21 @@ const first = makeContext();
 const firstSession = makeSession('session-shared', outdir);
 first.injectedAgents.push({ id: 'session-shared', inject: () => {} });
 apply(first.ctx, { intervalTokens: 10, outputDir: sharedDir, notifyInSession: false });
-first.emit({ type: 'assistant/message', data: { usage: { totalTokens: 15 } } }, firstSession);
+first.emit({ type: 'assistant/message', data: { usage: { inputTokens: 15, outputTokens: 0 } } }, firstSession);
 await new Promise((r) => setTimeout(r, 120));
 
 const second = makeContext();
+// Same session id: this is the real dual-process case (two Hosts, one session).
 const secondSession = makeSession('session-shared', outdir);
 second.injectedAgents.push({ id: 'session-shared', inject: () => {} });
 apply(second.ctx, { intervalTokens: 10, outputDir: sharedDir, notifyInSession: false });
-second.emit({ type: 'assistant/message', data: { usage: { totalTokens: 15 } } }, secondSession);
+second.emit({ type: 'assistant/message', data: { usage: { inputTokens: 15, outputTokens: 0 } } }, secondSession);
 await new Promise((r) => setTimeout(r, 120));
 
-const sharedFiles = (await readdir(sharedDir)).filter((f) => f.startsWith('summary-')).sort();
+const sharedFiles = (await readdir(sharedDir)).filter((f) => f.startsWith('handoff-')).sort();
 assert.equal(sharedFiles.length, 2, `both instances filed, got ${sharedFiles.join(', ')}`);
-assert.match(sharedFiles[0], /^summary-0001-/, 'first file keeps batch 1');
-assert.match(sharedFiles[1], /^summary-0002-/, `second instance must not reuse batch 1, got ${sharedFiles[1]}`);
+assert.match(sharedFiles[0], /^handoff-.*?-0001-\d+-/, 'first file keeps ordinal 1');
+assert.match(sharedFiles[1], /^handoff-.*?-0002-\d+-/, `second instance must not reuse ordinal 1, got ${sharedFiles[1]}`);
 
 // Regression: archiving is INCREMENTAL. Each batch must summarize only the span
 // produced since the previous batch. Re-summarizing the whole history made every
@@ -221,7 +222,7 @@ const incSession = makeSession('session-inc', outdir);
 apply(inc.ctx, { intervalTokens: 10, outputDir: incDir, notifyInSession: false });
 for (const [round, text] of [[1, '第一轮独有的内容'], [2, '第二轮独有的内容'], [3, '第三轮独有的内容']]) {
   incSession.appendTurn(text);
-  inc.emit({ type: 'assistant/message', data: { usage: { totalTokens: 15 } } }, incSession);
+  inc.emit({ type: 'assistant/message', data: { usage: { inputTokens: 15, outputTokens: 0 } } }, incSession);
   await new Promise((r) => setTimeout(r, 150));
 }
 assert.equal(inc.llmCalls.length, 3, `three crossings, three model calls, got ${inc.llmCalls.length}`);
@@ -249,14 +250,14 @@ lostSession.ownEvents = () => {
   return [{ type: 'user/message', data: { content: [{ type: 'text', text: 'hi' }] } }];
 };
 apply(lost.ctx, { intervalTokens: 10, outputDir: failDir2, notifyInSession: false });
-lost.emit({ type: 'assistant/message', data: { usage: { totalTokens: 15 } } }, lostSession); // boundary 10
+lost.emit({ type: 'assistant/message', data: { usage: { inputTokens: 15, outputTokens: 0 } } }, lostSession); // boundary 10
 await new Promise((r) => setTimeout(r, 150));
 // The failure must not have burned boundary 10: the next crossing retries it.
 // Both the span 0-9 (whose archive failed) and the events arriving in between
 // are still unconsumed, so the retry covers everything up to boundary 30.
-lost.emit({ type: 'assistant/message', data: { usage: { totalTokens: 15 } } }, lostSession); // total 30
+lost.emit({ type: 'assistant/message', data: { usage: { inputTokens: 15, outputTokens: 0 } } }, lostSession); // total 30
 await new Promise((r) => setTimeout(r, 250));
-const lossFiles = (await readdir(failDir2)).filter((f) => f.startsWith('summary-')).sort();
+const lossFiles = (await readdir(failDir2)).filter((f) => f.startsWith('handoff-')).sort();
 assert.equal(lossFiles.length, 1, `the retry files one report, got ${lossFiles.join(', ')}`);
 // It must cover all three pending boundaries, proving 10 was not skipped.
 assert.match(lossFiles[0], /-30-/, `the retry must span up to boundary 30, got ${lossFiles[0]}`);
@@ -272,9 +273,9 @@ const multiDir = join(outdir, 'multi');
 const multi = makeContext();
 multi.injectedAgents.push({ id: 'session-multi', inject: () => {} });
 apply(multi.ctx, { intervalTokens: 10, outputDir: multiDir, notifyInSession: false });
-multi.emit({ type: 'assistant/message', data: { usage: { totalTokens: 35 } } }, makeSession('session-multi', outdir));
+multi.emit({ type: 'assistant/message', data: { usage: { inputTokens: 35, outputTokens: 0 } } }, makeSession('session-multi', outdir));
 await new Promise((r) => setTimeout(r, 400));
-const multiFiles = (await readdir(multiDir)).filter((f) => f.startsWith('summary-'));
+const multiFiles = (await readdir(multiDir)).filter((f) => f.startsWith('handoff-'));
 // 35 tokens cross the 10/20/30 boundaries at once: one file covering all three,
 // and exactly one model call for the single transcript.
 assert.equal(multiFiles.length, 1, `one crossing, one report, got ${multiFiles.join(', ')}`);
@@ -295,12 +296,13 @@ for (const host of burst) {
 }
 const burstSession = makeSession('session-burst', outdir);
 for (const host of burst) {
-  host.emit({ type: 'assistant/message', data: { usage: { totalTokens: 15 } } }, burstSession);
+  host.emit({ type: 'assistant/message', data: { usage: { inputTokens: 15, outputTokens: 0 } } }, burstSession);
 }
 await new Promise((r) => setTimeout(r, 600));
-const burstFiles = (await readdir(burstDir)).filter((f) => f.startsWith('summary-')).sort();
+const burstFiles = (await readdir(burstDir)).filter((f) => f.startsWith('handoff-')).sort();
 assert.equal(burstFiles.length, BURST, `no batch may be lost, expected ${BURST}, got ${burstFiles.join(', ')}`);
-const burstOrdinals = burstFiles.map((f) => f.split('-')[1]);
+// The ordinal is the 4-digit run, now that file names carry a session tag too.
+const burstOrdinals = burstFiles.map((f) => /-(\d{4,})-\d+-[\dTZ:.-]+\.md$/.exec(f)[1]);
 assert.equal(new Set(burstOrdinals).size, BURST, `ordinals must be unique, got ${burstOrdinals.join(', ')}`);
 // No reservation placeholder may survive a completed write.
 const leftovers = (await readdir(burstDir)).filter((f) => f.startsWith('.claim-'));

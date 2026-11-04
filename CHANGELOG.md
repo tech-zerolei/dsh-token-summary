@@ -9,6 +9,58 @@
 
 <!-- 下一次发布前把内容归入新的版本小节 -->
 
+## [2.0.0] - 2026-11-05
+
+从「分片归档」改为「可交接的长文档」。这是一次破坏性变更：计量口径、文件命名、
+输出语义全部改变，v1 的归档与 v2 不通用。
+
+### Breaking changes
+
+- **计量口径改为「纯新增文本」**：只计 `inputTokens + outputTokens`，**不再计入
+  `cacheReadTokens` / `cacheWriteTokens`**。真实样本中 `totalTokens` 为 26,192
+  而其中 23,296 是缓存命中，实际新增仅 2,896 —— 旧口径让阈值虚高约 10 倍，
+  50 万的门槛几轮就"达到"。
+- **文件名改为 `handoff-<标题>--<哈希>-<序号>-<边界>-<时间戳>.md`**，从 `summary-` 前缀
+  改为 `handoff-`，并加入会话标识。
+- **每份文档是累积的交接文档**，不是独立分片：首次为全量，之后把新增内容合并进上一份，
+  文档越来越长。v1 的每份互相独立。
+
+### Added
+
+- **交接文档结构**：九节固定结构（任务全景 / 当前状态 / 已完成的工作 / 关键决策与理由 /
+  文件与路径清单 / 命令配置与数据 / 遇到的问题与解决 / 未完成事项与下一步 / 风险与注意），
+  面向「另一个没有任何上下文的 Agent 读完后能直接接着干」。实测单份 5,000+ 字符。
+- **`reasoningEffort` 配置（默认 `low`）**：写文档是转录任务而非推理任务，推理模型的
+  隐藏 reasoning token 与正文共享输出预算。实测 medium 下 reasoning 吃掉 2,797 字符而
+  正文仅剩 455 字符，low 下正文 706 字符。
+- **`standDownEnv` 配置**：识别次级 Harness 进程（如 `DSH_PHONE_AS_MINTER`）并停摆，
+  避免两个进程各自计数、为每批写两份文档。
+- `audit-check.mjs`：代码审查发现的三个缺陷的回归测试。
+
+### Fixed
+
+- **多会话共用输出目录时互相污染**：`readLatestDocument` 按目录取最新文件，导致
+  会话 A 把会话 B 的文档当成自己的上一份合并。现在文件名与会话绑定（稳定哈希，
+  经受住标题变更），查找按哈希而非标题。
+- **重启后误判首份**：`isFirst` 原先依赖内存游标，重启归零后被当作「首份」重新总结
+  全部历史。现在以磁盘上是否已有本会话文档为准，并把「已覆盖事件数」写进文档，
+  重启后可精确续接。
+- **空内容文档刷屏**：某区间没有可读文本时，旧的判空条件 `text === '' && fresh.length === 0`
+  漏掉了「有事件但无文本」的情况，且边界不推进，导致同一阈值每 20 秒产出一份空文档
+  （实测连续 10+ 份 `用户消息 0 / 摘要输入字符 0`）。现在按「有无可读文本」判定、
+  推进边界，并在尾部无文本时向前扩窗。
+- **极大 usage 打死进程**：单次 `usage` 极大时边界循环无上限，`Array.push` 抛
+  `RangeError: Invalid array length`。现在边界数量封顶 1000。
+- **文件名正则被数字贪心吃掉**：`handoff-<tag>-<序号>` 的可选 tag 段会吞掉序号，
+  产出 `2027` 这样的编号。现在全部锚定文件名尾部的不变量。
+- **索引格式**：去掉多余空行，「第 N 批」统一为「第 N 版」。
+
+### Changed
+
+- 默认 `intervalTokens` 1000 万 → **50 万**（纯新增文本口径）。
+- `maxSummaryOutputTokens` 2048 → **8192**，`maxTranscriptChars` 12 万 → **40 万**。
+- 启动日志明确说明输出目录（`outputDir` 留空时写到各会话工作目录的 `.dsh-summaries/`）。
+
 ## [1.1.0] - 2026-11-04
 
 让较短的归档间隔真正可用。此前把 `intervalTokens` 调小（如 256K）会瞬间产出
@@ -197,7 +249,8 @@
   因此计数器保存在内存中，随进程重启归零。
 - v1.0.0 不含 UI 面板：归档产物是文件，需求本体在文件上，面板收益低于维护成本。
 
-[Unreleased]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/tech-zerolei/dsh-token-summary/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.1.0...v2.0.0
 [1.1.0]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.0.1...v1.0.2

@@ -11,7 +11,7 @@
 /** Default runtime configuration. Every field is optional in `cordis.patch.yml`. */
 export const DEFAULT_CONFIG = Object.freeze({
   /** Token budget of one summary batch. Crossing it produces one Markdown file. */
-  intervalTokens: 2_000_000,
+  intervalTokens: 500_000,
   /** Absolute output directory; empty selects `<session cwd>/.dsh-summaries`. */
   outputDir: '',
   /** Provider route override; must be given together with `model`. */
@@ -19,13 +19,20 @@ export const DEFAULT_CONFIG = Object.freeze({
   /** Exact model id override; must be given together with `provider`. */
   model: '',
   /** Provider generation cap for the summary call. */
-  maxSummaryOutputTokens: 2048,
+  maxSummaryOutputTokens: 8192,
   /** UTF-8 character ceiling for the replayed transcript handed to the model. */
-  maxTranscriptChars: 120_000,
+  maxTranscriptChars: 400_000,
   /** End-to-end deadline for one summary request. */
   timeoutMs: 180_000,
   /** Whether to leave a durable notice in the session that crossed the batch. */
   notifyInSession: true,
+  /**
+   * Reasoning effort for the handoff call. Writing a document is transcription,
+   * not problem solving: on reasoning models the hidden reasoning tokens share
+   * the output budget with the document, so a high effort truncates it. Low
+   * effort keeps the budget for the text. Empty string uses the model default.
+   */
+  reasoningEffort: 'low',
   /**
    * Comma-separated env vars that mark this Host as a secondary Harness process.
    * When any is set the plugin stands down, because another process is already
@@ -64,6 +71,7 @@ export function normalizeConfig(config) {
       maxSummaryOutputTokens: positiveInteger(raw.maxSummaryOutputTokens, DEFAULT_CONFIG.maxSummaryOutputTokens),
       maxTranscriptChars: positiveInteger(raw.maxTranscriptChars, DEFAULT_CONFIG.maxTranscriptChars),
       timeoutMs: positiveInteger(raw.timeoutMs, DEFAULT_CONFIG.timeoutMs),
+      reasoningEffort: typeof raw.reasoningEffort === 'string' ? raw.reasoningEffort.trim() : DEFAULT_CONFIG.reasoningEffort,
       standDownEnv: typeof raw.standDownEnv === 'string' ? raw.standDownEnv.trim() : DEFAULT_CONFIG.standDownEnv,
       notifyInSession: raw.notifyInSession !== false,
       enabled: raw.enabled !== false,
@@ -79,16 +87,17 @@ export function normalizeConfig(config) {
  */
 export function usageTokens(usage) {
   if (usage === null || typeof usage !== 'object') return 0;
-  if (Number.isFinite(usage.totalTokens) && usage.totalTokens > 0) return Math.floor(usage.totalTokens);
-  // No provider total: reconstruct it the way the Harness's own token meter does
-  // (`pressureFrom` / the fold in dsh-token-meter):
-  //   input + cacheRead + cacheWrite + output
-  // Omitting the cache buckets would undercount a cache-heavy turn by an order
-  // of magnitude, since cached input is billed too.
+  // Count NEW text the model actually processed, not the replayed context.
+  //
+  // Providers report cached prefix reads separately, and they usually dominate a
+  // long conversation (`totalTokens` can be 26,192 where 23,296 of it is cache
+  // reads and the genuinely new text is only 2,896). Measuring `totalTokens`
+  // therefore inflates the counter by an order of magnitude and makes a
+  // "500K token" threshold fire after a handful of turns.
+  //
+  // So: input + output only. Cache reads/writes are deliberately excluded.
   const n = (value) => (Number.isFinite(value) && value > 0 ? value : 0);
-  return Math.floor(
-    n(usage.inputTokens) + n(usage.cacheReadTokens) + n(usage.cacheWriteTokens) + n(usage.outputTokens),
-  );
+  return Math.floor(n(usage.inputTokens) + n(usage.outputTokens));
 }
 
 /**
@@ -218,23 +227,111 @@ export function buildTranscript(events, limits) {
 
 /** The instruction handed to the summarizer model. */
 export const SUMMARY_INSTRUCTION = [
-  '你是一名会话归档员。请把下面这段 DeepSeek Harness 编程会话整理成一份 Markdown 总结。',
+  '你是一名资深工程交接文档撰写者。请把下面这段 DeepSeek Harness 编程会话，整理成一份**可以直接交给另一个 AI 编程助手接着干**的详细交接文档。',
   '',
-  '要求：',
-  '- 只输出 Markdown 正文，不要代码围栏包裹整篇，不要任何前后寒暄。',
-  '- 使用二级标题分节，建议包含：任务目标、已完成的工作、关键决策与原因、涉及的文件与路径、未完成与后续步骤、风险与注意事项。',
-  '- 忠实于对话内容；不确定的信息标注「未提及」，不要猜测或虚构文件名、命令、数字。',
-  '- 保留仍然有效的具体事实：路径、命令、版本号、配置值、错误信息。',
-  '- 简洁克制：不超过 800 字，条目化表达优先于长段落。',
+  '读者是一个没有任何上下文的新 Agent。它读完这份文档后，必须能够无缝继续工作，不需要回头翻原始对话。',
+  '',
+  '## 输出结构（严格按此顺序，每节都要有；无内容写「（无）」）',
+  '',
+  '### 1. 任务全景',
+  '- 用户最初的目标，以及目标随对话如何演变（逐条，保留用户的原始措辞要点）。',
+  '',
+  '### 2. 当前状态',
+  '- 现在进行到哪一步；哪些已完成、哪些进行中、哪些待开始。',
+  '',
+  '### 3. 已完成的工作（逐项）',
+  '- 每一项：做了什么、改了哪个文件、为什么这么做。',
+  '- 涉及具体代码时，给出关键片段（函数签名、配置片段、命令），不要只写「修改了某文件」。',
+  '',
+  '### 4. 关键决策与理由',
+  '- 每个决策：选了什么、放弃了什么备选、为什么。',
+  '- 特别记录用户明确表达过的偏好、纠正和否决。',
+  '',
+  '### 5. 文件与路径清单',
+  '- 精确路径 + 该文件的作用 + 当前状态（新建/修改/待改）。',
+  '',
+  '### 6. 命令、配置与数据',
+  '- 执行过的关键命令、写入的配置值、版本号、端口、环境变量。',
+  '- 精确到可以直接复制粘贴。',
+  '',
+  '### 7. 遇到的问题与解决',
+  '- 报错原文（保留完整错误串）、根因、解决办法、是否已验证。',
+  '',
+  '### 8. 未完成事项与下一步',
+  '- 明确列出还没做完的事；',
+  '- 给出**下一个具体动作**（不是泛泛的「继续开发」）。',
+  '',
+  '### 9. 风险与注意',
+  '- 已知的坑、脆弱点、未验证的假设、需要小心的地方。',
+  '',
+  '## 写作要求',
+  '- 详细优先：宁可长，不要漏。目标 1500–4000 字，信息密度高。',
+  '- 保留所有精确事实：文件路径、命令、错误串、标识符、数字、函数签名。',
+  '- 不确定的信息写「未提及」，**绝不虚构**文件名、命令或数字。',
+  '- 用条目而非大段散文；每条自成一体，可单独理解。',
+  '- 只输出 Markdown 正文，不要代码围栏包裹整篇，不要前言或结语。',
+  '- 不要说「本次会话」「在上面的对话中」这类指代——文档要能脱离原对话独立阅读。',
+].join('\n');
+
+/** Instruction used when extending an existing handoff document with new material. */
+export const EXTEND_INSTRUCTION = [
+  '你正在维护一份**工程交接文档**。下面会给你「已有文档」和「此后新增的对话」。',
+  '',
+  '你的任务：把新增内容合并进已有文档，输出**完整的、合并后的新文档**（不是补丁，是全文）。',
+  '',
+  '## 合并规则',
+  '- 保留已有文档中**所有仍然成立**的事实、决策、路径、命令、错误串。',
+  '- 新增内容按其性质并入对应小节（新完成的工作并入「已完成」、新决策并入「关键决策」等）。',
+  '- 已过时或被推翻的内容：不要直接删，改为在原文后标注「（已被后续推翻：原因）」。',
+  '- 「当前状态」「未完成事项与下一步」这两节**以最新进展为准重写**，因为它们描述的是现在。',
+  '- 不要在文档里写「新增」「本次更新」之类的字样，最终文档要像一次写成的那样连贯。',
+  '',
+  '## 输出要求',
+  '- 输出完整的合并后文档，保持与已有文档相同的结构与小节顺序。',
+  // The model will happily "summarize" a merge down to a stub unless told
+  // explicitly that shrinking is a failure. Observed: a correct merge of a
+  // 300-char document came back as 499 chars, dropping whole sections.
+  '- **只增不减**：输出必须不短于「已有文档」。如果你发现写出来比原文短，说明漏了内容，必须补回去。',
+  '- 逐节检查：已有文档的每一个小节都必须在输出里出现，且该节原有的事实、路径、命令、数字一条都不能少。',
+  '- 宁可重复也不要遗漏；宁可变长也不要压缩。',
+  '- 精确保留文件路径、命令、错误串、标识符、数字。',
+  '- 只输出 Markdown 正文，不要前言、结语或代码围栏包裹整篇。',
 ].join('\n');
 
 /**
  * Frame the summarizer request input.
- * @param transcript - folded conversation text.
+ *
+ * With no previous document this asks for a complete handoff document; with one
+ * it asks for the merged, longer document, which is what makes the archive a
+ * growing handoff artifact rather than a pile of disjoint slices.
+ *
+ * @param transcript - folded conversation text for this span.
+ * @param previousDocument - the previous handoff document, when extending it.
  * @returns the final user-message text.
  */
-export function buildPrompt(transcript) {
-  return `${SUMMARY_INSTRUCTION}\n\n---\n\n# 会话记录\n\n${transcript}\n`;
+export function buildPrompt(transcript, previousDocument) {
+  // First handoff: write the whole document from the conversation.
+  if (previousDocument === undefined || previousDocument.trim() === '') {
+    return `${SUMMARY_INSTRUCTION}\n\n---\n\n# 会话记录\n\n${transcript}\n`;
+  }
+  // Later handoffs: merge the new span into the document that already exists, so
+  // the deliverable keeps growing instead of being replaced by a fresh stub.
+  return [
+    EXTEND_INSTRUCTION,
+    '',
+    '---',
+    '',
+    '# 已有文档',
+    '',
+    previousDocument.trim(),
+    '',
+    '---',
+    '',
+    '# 此后新增的对话',
+    '',
+    transcript,
+    '',
+  ].join('\n');
 }
 
 /** Render an integer with thousands separators. */
@@ -278,6 +375,7 @@ export function renderMarkdown(input) {
     truncated,
     transcriptChars,
     spanned,
+    coveredEvents,
   } = input;
   const rows = [
     ['生成时间', new Date(finishedAt).toISOString()],
@@ -287,6 +385,10 @@ export function renderMarkdown(input) {
     ['本批序号', `第 ${batch} 批`],
     ['本批区间', `${formatNumber(startedAt)} → ${formatNumber(totalTokens - 1)} token`],
     ['跨越区间数', String(spanned ?? 1)],
+    // Recorded so a restarted process resumes exactly where this one stopped:
+    // the in-memory cursor is lost on restart, and guessing produced empty
+    // documents that repeated forever.
+    ['已覆盖事件数', String(coveredEvents ?? 0)],
     ['批大小', `${formatNumber(intervalTokens)} token`],
     ['累计 token', formatNumber(totalTokens)],
     ['摘要模型', route === undefined ? '（未解析）' : `${route.provider} / ${route.model}`],
@@ -311,11 +413,11 @@ export function renderMarkdown(input) {
       '```',
     ].join('\n');
   return [
-    `# 会话总结 · 第 ${batch} 批（每 ${formatNumber(intervalTokens)} token 一次）`,
+    `# 工程交接文档 · 第 ${batch} 版（每累计 ${formatNumber(intervalTokens)} token 更新）`,
     '',
     table,
     '',
-    '## 摘要',
+    '## 交接正文',
     '',
     body,
     '',
@@ -333,7 +435,7 @@ export function renderMarkdown(input) {
  */
 export function renderIndexEntry(input) {
   const stamp = new Date(input.finishedAt).toISOString().replace('T', ' ').slice(0, 19);
-  return `- ${stamp} · 第 ${input.batch} 批 · 累计 ${formatNumber(input.totalTokens)} token · [${input.fileName}](${encodeURI(input.fileName)}) · \`${input.sessionId}\``;
+  return `- ${stamp} · 第 ${input.batch} 版 · 累计 ${formatNumber(input.totalTokens)} token · [${input.fileName}](${encodeURI(input.fileName)}) · \`${input.sessionId}\``;
 }
 
 /**
@@ -347,17 +449,17 @@ export function buildNotice(input) {
   let head;
   let tail;
   if (input.writeFailed) {
-    head = `每 ${formatNumber(input.intervalTokens)} token 归档：第 ${input.batch} 批写入失败`;
+    head = `每 ${formatNumber(input.intervalTokens)} token 更新交接文档：第 ${input.batch} 版写入失败`;
     tail = '（未生成文件，详见日志）';
   } else if (input.failure === undefined) {
     // `spanned` > 1 means one crossing covered several intervals at once; say so
     // instead of pretending the batch was a single interval.
     const span = input.spanned !== undefined && input.spanned > 1 ? `，覆盖 ${input.spanned} 个区间` : '';
-    head = `每 ${formatNumber(input.intervalTokens)} token 归档：第 ${input.batch} 批总结已写入 ${input.fileName}`;
+    head = `交接文档已更新（第 ${input.batch} 版）：${input.fileName}`;
     tail = `（累计 ${formatNumber(input.totalTokens)} token${span}）`;
   } else {
     const span = input.spanned !== undefined && input.spanned > 1 ? `，覆盖 ${input.spanned} 个区间` : '';
-    head = `每 ${formatNumber(input.intervalTokens)} token 归档：第 ${input.batch} 批已写入 ${input.fileName}`;
+    head = `交接文档已更新（第 ${input.batch} 版）：${input.fileName}`;
     tail = `（摘要模型调用失败，文件内为统计兜底${span}）`;
   }
   const text = `${head}${tail}`;

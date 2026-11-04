@@ -41,7 +41,7 @@ const session = {
 apply(ctx, { intervalTokens: 10, outputDir: dir, notifyInSession: false });
 // 等待所有 worker 大致同时起跑，再触发
 await new Promise((r) => setTimeout(r, Number(process.argv[2])));
-ctx._h(session, { type: 'assistant/message', data: { usage: { totalTokens: 15 } } });
+ctx._h(session, { type: 'assistant/message', data: { usage: { inputTokens: 12, outputTokens: 3 } } });
 await new Promise((r) => setTimeout(r, 400));
 process.exit(0);
 `;
@@ -66,8 +66,9 @@ for (let round = 1; round <= ROUNDS; round += 1) {
     ),
   );
 
-  const files = (await readdir(dir).catch(() => [])).filter((f) => f.startsWith('summary-')).sort();
-  const ordinals = files.map((f) => f.split('-')[1]);
+  const files = (await readdir(dir).catch(() => [])).filter((f) => f.startsWith('handoff-')).sort();
+  // File names carry a session tag, so the ordinal is the 4-digit run.
+  const ordinals = files.map((f) => /-(\d{4,})-\d+-[\dTZ:.-]+\.md$/.exec(f)[1]);
   const unique = new Set(ordinals);
   const lost = WORKERS - files.length;
   const dup = ordinals.length - unique.size;
