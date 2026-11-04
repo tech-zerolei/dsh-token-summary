@@ -1,0 +1,64 @@
+{
+  "name": "dsh-token-summary",
+  "version": "1.0.0",
+  "description": "每累计 1000 万 token 自动把一个 DeepSeek Harness 会话总结成一份 Markdown 归档文件（全局计数、模型摘要、落盘与通知）",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./logic": "./logic.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "logic.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node selftest.mjs && node e2e.mjs",
+    "test:logic": "node selftest.mjs",
+    "test:e2e": "node e2e.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "cordis",
+    "cordis-plugin",
+    "harness-plugin",
+    "host-plugin",
+    "token",
+    "token-usage",
+    "token-counter",
+    "summarization",
+    "session-summary",
+    "context-management",
+    "markdown",
+    "archival",
+    "llm",
+    "ai-agent",
+    "coding-agent"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "author": "zerolei",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tech-zerolei/dsh-token-summary.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tech-zerolei/dsh-token-summary/issues"
+  },
+  "homepage": "https://github.com/tech-zerolei/dsh-token-summary#readme"
+}

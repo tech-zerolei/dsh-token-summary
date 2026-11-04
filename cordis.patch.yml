@@ -1,0 +1,12 @@
+# Inserts the token-summary Host plugin into the profile root.
+# Tune every field in this row's `config`; the object below is the default.
+- insert:
+    - id: token-summary
+      name: 'dsh-token-summary'
+      config:
+        intervalTokens: 10000000
+        outputDir: ''
+        maxSummaryOutputTokens: 2048
+        maxTranscriptChars: 120000
+        notifyInSession: true
+        enabled: true

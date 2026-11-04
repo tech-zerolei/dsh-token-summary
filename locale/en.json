@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Token Summary Archive",
+    "description": "Counts tokens globally and, at every 10M-token boundary, summarizes the current session into a Markdown file with a model and posts a one-line notice."
+  }
+}

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Token summary archive">
+  <title>Token summary archive</title>
+  <rect x="4" y="8" width="56" height="48" rx="8" fill="#0f2a3d"/>
+  <path d="M14 20h26M14 28h20M14 36h26M14 44h14" stroke="#4fb3d9" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="48" cy="42" r="11" fill="#0f2a3d" stroke="#f2b544" stroke-width="3"/>
+  <path d="M43.5 42.2l3 3.1 6-6.4" stroke="#f2b544" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>

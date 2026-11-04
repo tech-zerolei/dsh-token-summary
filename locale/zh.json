@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Token 总结归档",
+    "description": "全局累计 token，每跨过一千万 token 就把当前会话用模型总结成一份 Markdown 文件，并在会话里留一条通知。"
+  }
+}
