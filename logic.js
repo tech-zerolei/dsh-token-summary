@@ -73,9 +73,15 @@ export function normalizeConfig(config) {
 export function usageTokens(usage) {
   if (usage === null || typeof usage !== 'object') return 0;
   if (Number.isFinite(usage.totalTokens) && usage.totalTokens > 0) return Math.floor(usage.totalTokens);
-  const input = Number.isFinite(usage.inputTokens) ? Math.max(0, usage.inputTokens) : 0;
-  const output = Number.isFinite(usage.outputTokens) ? Math.max(0, usage.outputTokens) : 0;
-  return Math.floor(input + output);
+  // No provider total: reconstruct it the way the Harness's own token meter does
+  // (`pressureFrom` / the fold in dsh-token-meter):
+  //   input + cacheRead + cacheWrite + output
+  // Omitting the cache buckets would undercount a cache-heavy turn by an order
+  // of magnitude, since cached input is billed too.
+  const n = (value) => (Number.isFinite(value) && value > 0 ? value : 0);
+  return Math.floor(
+    n(usage.inputTokens) + n(usage.cacheReadTokens) + n(usage.cacheWriteTokens) + n(usage.outputTokens),
+  );
 }
 
 /**
@@ -218,6 +224,20 @@ export function formatNumber(value) {
 }
 
 /**
+ * Render one value safe for a Markdown table cell.
+ *
+ * A raw `|` would be read as a column separator and a newline would end the row,
+ * so session titles, working directories, and model ids — all caller-controlled
+ * text — must be escaped rather than trusted.
+ *
+ * @param value - cell text.
+ * @returns the escaped single-line cell text.
+ */
+export function tableCell(value) {
+  return String(value).replace(/\r\n|\r|\n/g, ' ').replace(/\|/g, '\\|');
+}
+
+/**
  * Render the human-facing Markdown document for one completed batch.
  * @param input - batch facts, transcript statistics, and the summary body.
  * @returns the Markdown file body.
@@ -254,7 +274,7 @@ export function renderMarkdown(input) {
     ['工具失败', String(stats.toolFailures)],
     ['摘要输入字符', formatNumber(transcriptChars)],
   ];
-  const table = ['| 项目 | 值 |', '| --- | --- |', ...rows.map(([k, v]) => `| ${k} | ${v} |`)].join('\n');
+  const table = ['| 项目 | 值 |', '| --- | --- |', ...rows.map(([k, v]) => `| ${tableCell(k)} | ${tableCell(v)} |`)].join('\n');
   const body = failure === undefined
     ? summaryText.trim()
     : [
@@ -296,10 +316,20 @@ export function renderIndexEntry(input) {
  * @returns a bounded single-line notice.
  */
 export function buildNotice(input) {
-  const head = `每 ${formatNumber(input.intervalTokens)} token 归档：第 ${input.batch} 批总结已写入 ${input.fileName}`;
-  const tail = input.failure === undefined
-    ? `（累计 ${formatNumber(input.totalTokens)} token）`
-    : '（摘要模型调用失败，文件内为统计兜底）';
+  // Three distinct outcomes, three distinct messages. Collapsing them into one
+  // sentence is how a failed write ends up reported as "已写入".
+  let head;
+  let tail;
+  if (input.writeFailed) {
+    head = `每 ${formatNumber(input.intervalTokens)} token 归档：第 ${input.batch} 批写入失败`;
+    tail = '（未生成文件，详见日志）';
+  } else if (input.failure === undefined) {
+    head = `每 ${formatNumber(input.intervalTokens)} token 归档：第 ${input.batch} 批总结已写入 ${input.fileName}`;
+    tail = `（累计 ${formatNumber(input.totalTokens)} token）`;
+  } else {
+    head = `每 ${formatNumber(input.intervalTokens)} token 归档：第 ${input.batch} 批已写入 ${input.fileName}`;
+    tail = '（摘要模型调用失败，文件内为统计兜底）';
+  }
   const text = `${head}${tail}`;
   const points = [...text];
   return points.length <= 120 ? text : `${points.slice(0, 119).join('')}…`;

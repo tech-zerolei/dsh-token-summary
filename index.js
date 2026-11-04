@@ -19,7 +19,7 @@
  * @module dsh-token-summary
  */
 
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import {
   buildNotice,
@@ -114,6 +114,8 @@ export function apply(ctx, rawConfig) {
   let batch = 0;
   /** Serializes boundary handling so two sessions never write the same batch. */
   let queue = Promise.resolve();
+  /** Monotonic tie-breaker so two notices in the same millisecond still differ. */
+  let noticeSeq = 0;
 
   /**
    * A service this plugin may use but does not depend on.
@@ -201,24 +203,52 @@ export function apply(ctx, rawConfig) {
    * otherwise both write "第 1 批". Scanning the directory makes the ordinal a
    * property of the archive, so numbering stays monotonic across processes.
    *
+   * Scanning alone is not enough, though: read-then-write is a TOCTOU race, and
+   * two instances that start at the same moment can read the same "highest" and
+   * then pick the same number — the second file silently overwrites the first,
+   * losing an archived summary. So the number is *claimed* atomically with an
+   * exclusive-create placeholder (`wx`), and a loser retries the next candidate.
+   *
    * @param dir - output directory that will receive the batch file.
-   * @returns the next free ordinal, at least `batch + 1`.
+   * @returns the claimed ordinal and the placeholder path that reserves it.
    */
   const nextOrdinal = async (dir) => {
     batch += 1;
-    let highest = batch - 1;
+    let candidate = batch;
+    // The claim below needs the directory to exist: `open(..., 'wx')` on a
+    // missing directory reports ENOENT, which is not a lost race and must not be
+    // mistaken for one.
+    await mkdir(dir, { recursive: true }).catch(() => {});
     try {
       for (const entry of await readdir(dir)) {
         const match = /^summary-(\d+)-/.exec(entry);
         if (match === null) continue;
         const seen = Number(match[1]);
-        if (Number.isSafeInteger(seen) && seen > highest) highest = seen;
+        if (Number.isSafeInteger(seen) && seen >= candidate) candidate = seen + 1;
       }
     } catch {
       // A missing directory simply means no batch has been filed there yet.
     }
-    batch = highest + 1;
-    return batch;
+    // Try candidates until one exclusive create succeeds. A concurrent writer
+    // that grabbed the same number leaves its claim file behind, so we move on.
+    for (let attempt = 0; attempt < 10_000; attempt += 1) {
+      if (candidate > batch) batch = candidate;
+      const claimPath = join(dir, `.claim-${String(candidate).padStart(4, '0')}`);
+      try {
+        const handle = await open(claimPath, 'wx');
+        await handle.close();
+        return { ordinal: candidate, claimPath };
+      } catch (error) {
+        if (error?.code === 'EEXIST') {
+          candidate += 1;
+          continue;
+        }
+        // Not a lost race (read-only directory, exhausted handles, ...): keep the
+        // scanned number rather than failing the batch outright.
+        return { ordinal: candidate, claimPath: undefined };
+      }
+    }
+    return { ordinal: candidate, claimPath: undefined };
   };
 
   /**
@@ -235,9 +265,9 @@ export function apply(ctx, rawConfig) {
     const { text: summaryText, failure: summaryFailure } = await summarize(session, transcript, route);
 
     const dir = outputDirFor(session, agent);
-    // Ask for the ordinal only after the await above, so two concurrent writers
-    // in this process cannot reserve the same number.
-    const ordinal = await nextOrdinal(dir);
+    // Claim the ordinal only after the await above, so two concurrent writers
+    // in this process cannot reserve the same number either.
+    const { ordinal, claimPath } = await nextOrdinal(dir);
     const stamp = new Date(finishedAt).toISOString().replace(/[:.]/g, '-');
     const fileName = `summary-${String(ordinal).padStart(4, '0')}-${boundary}-${stamp}.md`;
     const filePath = join(dir, fileName);
@@ -258,6 +288,10 @@ export function apply(ctx, rawConfig) {
     });
 
     let failure = summaryFailure;
+    // Track a write failure separately: "the summary call failed" and "nothing
+    // reached the disk" are different outcomes, and reporting the former as
+    // "已写入" tells the user a file exists when it does not.
+    let writeFailed = false;
     try {
       await mkdir(dir, { recursive: true });
       await writeFile(filePath, markdown, 'utf8');
@@ -284,9 +318,14 @@ export function apply(ctx, rawConfig) {
         // ignore: index maintenance is best-effort
       }
     } catch (error) {
+      writeFailed = true;
       failure ??= `写入 ${filePath} 失败：${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      // Release the reservation: the real file now carries this number, and a
+      // leftover claim would make the next scan skip it needlessly.
+      if (claimPath !== undefined) await rm(claimPath, { force: true }).catch(() => {});
     }
-    return { ordinal, fileName, filePath, failure };
+    return { ordinal, fileName, filePath, failure, writeFailed };
   };
 
   /**
@@ -313,6 +352,14 @@ export function apply(ctx, rawConfig) {
    * and must not open a turn by itself. A session with no live agent (or a
    * profile without the agent registry) simply gets no notice — the Markdown
    * file is the deliverable.
+   *
+   * The message MUST be a complete `UserMessage`: `id` and `role` are not
+   * optional. `Session.append()` does not check them, so a malformed notice is
+   * accepted silently, but the reload path (`validateStoredEvents` →
+   * `assertMessageEventShape`) rejects it with "lacks an identified message",
+   * which makes the whole session unopenable — the archive would destroy the
+   * very session it archived. `id` also carries inbox de-duplication, so a
+   * missing one can make a second pending notice throw.
    */
   const notify = (session, text) => {
     if (!config.notifyInSession) return;
@@ -320,6 +367,8 @@ export function apply(ctx, rawConfig) {
     if (agent === undefined || typeof agent.inject !== 'function') return;
     try {
       agent.inject({
+        id: `token-summary-${session.id}-${Date.now().toString(36)}-${(noticeSeq += 1).toString(36)}`,
+        role: 'user',
         content: [{ type: 'text', text }],
         source: { kind: name, form: 'notice', summary: clip(text, 120) },
       });
@@ -342,13 +391,21 @@ export function apply(ctx, rawConfig) {
       .then(async () => {
         for (const boundary of boundaries) {
           const written = await writeSummary(session, boundary);
-          logger.info(`第 ${written.ordinal} 批已写入 ${written.filePath}`);
+          // Never claim a write that did not happen: the log line and the notice
+          // are the only feedback a user gets, so they must describe the real
+          // outcome.
+          if (written.writeFailed) {
+            logger.error(`第 ${written.ordinal} 批写入失败：${written.failure ?? '未知原因'}`);
+          } else {
+            logger.info(`第 ${written.ordinal} 批已写入 ${written.filePath}`);
+          }
           notify(session, buildNotice({
             batch: written.ordinal,
             intervalTokens: config.intervalTokens,
             totalTokens: boundary,
             fileName: written.fileName,
             failure: written.failure,
+            writeFailed: written.writeFailed,
           }));
         }
       })

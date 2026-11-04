@@ -9,6 +9,54 @@
 
 <!-- 下一次发布前把内容归入新的版本小节 -->
 
+## [1.0.2] - 2026-11-04
+
+### Fixed
+
+- **【P0】归档通知会永久损坏被归档的会话**：`agent.inject()` 传入的消息只有
+  `content` 和 `source`，缺少 `id` 与 `role: 'user'`。`Session.append()` 只做部分
+  结构校验，畸形消息被**静默接受**；但会话重新加载走
+  `validateStoredEvents → adoptSessionEvent → assertMessageEventShape` 时会抛
+  `SessionPersistenceCorruptionError: session event at seq N lacks an identified message`，
+  该会话此后 resume / fork / replay 全部失败。
+
+  触发条件是**默认配置**（`notifyInSession: true` + 每跨一个批次），即
+  「第一次归档成功 = 当次会话报废」，与本插件「归档以免丢失」的目的完全相反。
+
+  现在通知带完整 `id`（会话 id + 时间戳 + 单调序号，兼作收件箱去重键）与 `role`。
+
+- **【P1】多进程批次号竞态导致归档被静默覆盖**：v1.0.1 改为扫描目录推导编号，
+  但「读目录 → 写文件」之间仍是 TOCTOU 窗口，两个进程可以读到同一个最高编号，
+  后写者覆盖先写者、归档文件丢失。现改为用 `open(path, 'wx')` 独占创建占位文件
+  **原子地抢占编号**，失败则顺延下一个候选，写完释放占位。
+
+  另修复：目录不存在时 `open(..., 'wx')` 抛 `ENOENT` 而非 `EEXIST`，
+  曾被误判为"无法抢占"而降级到扫描结果，导致并发下仍会重号。
+
+- **【P1】写入失败却报告"已写入"**：目标不可写时，通知与日志仍输出
+  「第 N 批已写入 xxx.md」，而实际零文件产出。现在区分三种结局
+  （成功 / 摘要失败但有文件 / 写入失败），写入失败记 error 日志且通知改说「写入失败」。
+
+- **【P2】缓存 token 未计入**：`usageTokens` 在缺少 `totalTokens` 时只算
+  `input + output`，漏掉 `cacheReadTokens` / `cacheWriteTokens`。现按 Harness
+  官方 `dsh-token-meter` 口径改为 `input + cacheRead + cacheWrite + output`，
+  避免缓存命中多的轮次被低估一个数量级。
+
+- **【P2】Markdown 表格未转义**：会话标题、工作目录、模型 id 含 `|` 会撑出多余列，
+  含换行可注入伪造表格行。新增 `tableCell()` 转义。
+
+### Added
+
+- `persist-check.mjs`：把插件真实产出的通知写进真实 `Session`，再用真实
+  `validateStoredEvents` 校验，防止 P0 复发。
+- `concurrency-check.mjs`：用 `child_process` **真正 spawn 多个独立进程**抢同一
+  输出目录（既有的 e2e 并发用例是同进程串行，天然避开竞态，因此漏掉了 P1）。
+  实测 v1.0.1 下 5 轮全部失败（丢失 2、重号 12），本版本 5 轮 × 6 进程全绿。
+
+### Changed
+
+- `npm test` 现在会跑全部四个套件：逻辑、端到端、持久化、跨进程并发。
+
 ## [1.0.1] - 2026-11-04
 
 ### Fixed
@@ -69,6 +117,7 @@
   因此计数器保存在内存中，随进程重启归零。
 - v1.0.0 不含 UI 面板：归档产物是文件，需求本体在文件上，面板收益低于维护成本。
 
-[Unreleased]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/tech-zerolei/dsh-token-summary/releases/tag/v1.0.0

@@ -13,6 +13,7 @@ import {
   normalizeConfig,
   renderIndexEntry,
   renderMarkdown,
+  tableCell,
   usageTokens,
 } from './logic.js';
 
@@ -52,6 +53,29 @@ ok('usage prefers totalTokens and otherwise sums input plus output', () => {
   assert.equal(usageTokens({ inputTokens: 10, outputTokens: 5 }), 15);
   assert.equal(usageTokens(undefined), 0);
   assert.equal(usageTokens({ inputTokens: -3, outputTokens: 4 }), 4);
+});
+
+ok('usage counts cache buckets when the provider omits a total', () => {
+  // The Harness token meter folds input + cacheRead + cacheWrite + output; a
+  // cache-heavy turn without provider totals must not be undercounted.
+  assert.equal(usageTokens({ inputTokens: 10, outputTokens: 10, cacheReadTokens: 1000 }), 1020);
+  assert.equal(usageTokens({ inputTokens: 10, outputTokens: 10, cacheWriteTokens: 5 }), 25);
+  assert.equal(usageTokens({ inputTokens: 10, outputTokens: 10, totalTokens: 999, cacheReadTokens: 1000 }), 999);
+});
+
+ok('table cells escape pipes and fold newlines', () => {
+  assert.equal(tableCell('a|b'), 'a\\|b');
+  assert.equal(tableCell('a\nb'), 'a b');
+  assert.equal(tableCell('a\r\nb'), 'a b');
+});
+
+ok('the notice distinguishes write failure from summary failure', () => {
+  const base = { batch: 1, intervalTokens: 100, totalTokens: 100, fileName: 'x.md' };
+  assert.match(buildNotice(base), /总结已写入/);
+  assert.match(buildNotice({ ...base, failure: 'boom' }), /已写入.*统计兜底/);
+  const wf = buildNotice({ ...base, failure: 'boom', writeFailed: true });
+  assert.match(wf, /写入失败/);
+  assert.doesNotMatch(wf, /已写入/, 'a write failure must never say 已写入');
 });
 
 ok('clip never splits a surrogate pair and strips controls', () => {

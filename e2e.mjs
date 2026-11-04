@@ -43,6 +43,10 @@ function makeContext() {
       stream(options) {
         llmCalls.push(options);
         return (async function* () {
+          // Yield the microtask queue first: a real model call is never
+          // synchronous, and the concurrent-ordinal test needs the writers to
+          // interleave the way they do in production.
+          await new Promise((r) => setTimeout(r, 5));
           yield { type: 'text-delta', index: 0, text: '## 任务目标\n\n' };
           yield { type: 'text-delta', index: 0, text: '完成一个插件的交付。' };
           yield { type: 'finish', reason: { kind: 'stop' } };
@@ -194,6 +198,30 @@ const sharedFiles = (await readdir(sharedDir)).filter((f) => f.startsWith('summa
 assert.equal(sharedFiles.length, 2, `both instances filed, got ${sharedFiles.join(', ')}`);
 assert.match(sharedFiles[0], /^summary-0001-/, 'first file keeps batch 1');
 assert.match(sharedFiles[1], /^summary-0002-/, `second instance must not reuse batch 1, got ${sharedFiles[1]}`);
+
+// Regression: sequential instances are not enough. Two instances that fire at
+// the *same* instant race between reading the directory and writing the file
+// (TOCTOU); before the atomic claim every loser silently overwrote a winner, so
+// N concurrent crossings produced fewer than N files with duplicated ordinals.
+const burstDir = join(outdir, 'burst');
+const BURST = 8;
+const burst = Array.from({ length: BURST }, () => makeContext());
+for (const host of burst) {
+  host.injectedAgents.push({ id: 'session-burst', inject: () => {} });
+  apply(host.ctx, { intervalTokens: 10, outputDir: burstDir, notifyInSession: false });
+}
+const burstSession = makeSession('session-burst', outdir);
+for (const host of burst) {
+  host.emit({ type: 'assistant/message', data: { usage: { totalTokens: 15 } } }, burstSession);
+}
+await new Promise((r) => setTimeout(r, 600));
+const burstFiles = (await readdir(burstDir)).filter((f) => f.startsWith('summary-')).sort();
+assert.equal(burstFiles.length, BURST, `no batch may be lost, expected ${BURST}, got ${burstFiles.join(', ')}`);
+const burstOrdinals = burstFiles.map((f) => f.split('-')[1]);
+assert.equal(new Set(burstOrdinals).size, BURST, `ordinals must be unique, got ${burstOrdinals.join(', ')}`);
+// No reservation placeholder may survive a completed write.
+const leftovers = (await readdir(burstDir)).filter((f) => f.startsWith('.claim-'));
+assert.deepEqual(leftovers, [], `claim placeholders must be released, got ${leftovers.join(', ')}`);
 
 await rm(outdir, { recursive: true, force: true });
 console.log('e2e: all checks passed');
