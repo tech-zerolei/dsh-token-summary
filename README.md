@@ -207,7 +207,7 @@ pnpm add link:/path/to/dsh-token-summary
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
 | `intervalTokens` | `10000000` | 一个批次覆盖的 token 数（全局累计） |
-| `outputDir` | `''` | 输出目录；留空则写入 `<会话工作目录>/.dsh-summaries` |
+| `outputDir` | `''` | 输出目录；留空则写入 `<会话工作目录>/.dsh-summaries`，填绝对路径则所有会话集中写入该目录 |
 | `provider` | `''` | 摘要用的 provider 路由；**必须与 `model` 同时填写** |
 | `model` | `''` | 摘要用的精确模型 id |
 | `maxSummaryOutputTokens` | `2048` | 摘要请求的输出 token 上限 |
@@ -223,6 +223,28 @@ pnpm add link:/path/to/dsh-token-summary
 1. 配置里成对出现的 `provider` + `model`
 2. 该会话 `requestHeader()` 中记录的 route
 3. 活跃 agent 的 `options`
+
+### 输出位置怎么选
+
+`outputDir` 留空（默认）时，归档跟着会话工作目录走——每个项目一个 `.dsh-summaries/`，
+开新项目自动带一份，不会混在一起：
+
+```
+/root/work/project-a/.dsh-summaries/summary-0001-....md
+/root/work/project-b/.dsh-summaries/summary-0001-....md
+```
+
+填绝对路径则所有会话集中到一处，适合想统一检索、备份或纳入同一个仓库的场景：
+
+```yaml
+- id: token-summary
+  name: dsh-token-summary
+  config:
+    outputDir: /root/.dsh/summaries
+```
+
+> 切换 `outputDir` 不会搬动已有文件，旧归档留在原目录。需要保留历史就手动迁移，
+> 并注意索引 `README.md` 里的路径是写入时的快照。
 
 ---
 
