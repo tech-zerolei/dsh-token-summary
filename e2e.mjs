@@ -139,15 +139,19 @@ failing.injectedAgents.push({ id: 'session-fail', inject: (m) => failing.injecte
 failing.ctx.llm.stream = () => (async function* () {
   yield { type: 'finish', reason: { kind: 'error', failure: { message: '上游 502' } } };
 })();
-apply(failing.ctx, { intervalTokens: 10, outputDir: outdir, notifyInSession: true });
+// Each scenario gets its own output directory: matching batch files by name
+// would otherwise collide with the ISO timestamp embedded in the filename.
+const failDir = join(outdir, 'fail');
+apply(failing.ctx, { intervalTokens: 10, outputDir: failDir, notifyInSession: true });
 failing.emit({ type: 'assistant/message', data: { usage: { totalTokens: 25 } } }, session2);
 await new Promise((r) => setTimeout(r, 150));
 // 25 tokens cross both the 10 and the 20 boundary, so one report is filed per
 // boundary instead of a single shifted batch.
-const failFiles = (await readdir(outdir)).filter((f) => /-10-|-20-/.test(f) && f.startsWith('summary-'));
+const failFiles = (await readdir(failDir)).filter((f) => f.startsWith('summary-'));
 assert.equal(failFiles.length, 2, `one report per boundary, got ${failFiles.join(', ')}`);
-const failFile = failFiles.find((f) => f.includes('-10-'));
-const failMd = await readFile(join(outdir, failFile), 'utf8');
+const failFile = failFiles.find((f) => /^summary-\d{4}-10-/.test(f));
+assert.ok(failFile, `the batch for the 10 boundary exists, got ${failFiles.join(', ')}`);
+const failMd = await readFile(join(failDir, failFile), 'utf8');
 assert.match(failMd, /摘要模型调用失败/);
 assert.match(failMd, /上游 502/);
 assert.match(failing.injectedAgents.at(-1).content[0].text, /统计兜底/);
@@ -158,17 +162,14 @@ const unrouted = makeContext();
 const session3 = makeSession('session-noroute', outdir);
 session3.requestHeader = () => undefined;
 unrouted.injectedAgents.push({ id: 'session-noroute', inject: (m) => unrouted.injectedAgents.push(m) });
-apply(unrouted.ctx, { intervalTokens: 10, outputDir: outdir });
+const unroutedDir = join(outdir, 'unrouted');
+apply(unrouted.ctx, { intervalTokens: 10, outputDir: unroutedDir });
 unrouted.emit({ type: 'assistant/message', data: { usage: { totalTokens: 12 } } }, session3);
 await new Promise((r) => setTimeout(r, 120));
 assert.equal(unrouted.llmCalls.length, 0, 'no model call without a route');
-const allFiles = await readdir(outdir);
-let unroutedReport;
-for (const candidate of allFiles.filter((f) => f.startsWith('summary-'))) {
-  const body = await readFile(join(outdir, candidate), 'utf8');
-  if (body.includes('session-noroute')) unroutedReport = body;
-}
-assert.ok(unroutedReport, 'an unroutable crossing still files its report');
+const unroutedFiles = (await readdir(unroutedDir)).filter((f) => f.startsWith('summary-'));
+assert.equal(unroutedFiles.length, 1, `one report, got ${unroutedFiles.join(', ')}`);
+const unroutedReport = await readFile(join(unroutedDir, unroutedFiles[0]), 'utf8');
 assert.match(unroutedReport, /无法确定摘要路由/);
 
 await rm(outdir, { recursive: true, force: true });
