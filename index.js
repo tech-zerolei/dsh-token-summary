@@ -36,6 +36,9 @@ import {
 /** Cordis plugin name used by Loader diagnostics. */
 export const name = 'token-summary';
 
+/** Env var marking a secondary Harness process that must not archive. */
+const SECONDARY_PROCESS_ENV = 'DSH_PHONE_AS_MINTER';
+
 /** Host services this plugin needs; without them it stays inactive. */
 export const inject = ['llm'];
 
@@ -113,6 +116,22 @@ export function apply(ctx, rawConfig) {
     logger.info('disabled by config; nothing is counted');
     return;
   }
+  // A single machine can run more than one Harness process against the same
+  // profile: `dsh-phone-remote` spawns a second `dsh web` as a cookie minter and
+  // marks it with this variable so its own plugin stands down. Every cooperative
+  // process unrolls itself the same way. Without this guard that second process
+  // counts the same conversation independently and files a duplicate archive for
+  // every batch (two processes = two files per crossing).
+  // The marker list is configurable so the same protection covers other
+  // dual-process setups (test harnesses, remote bridges) without a code change.
+  const secondaryMarkers = (config.standDownEnv === '' ? [SECONDARY_PROCESS_ENV] : config.standDownEnv.split(','))
+    .map((name) => name.trim())
+    .filter((name) => name !== '');
+  const standDown = secondaryMarkers.find((name) => process.env[name] !== undefined);
+  if (standDown !== undefined) {
+    logger.info(`running as a secondary Harness process (${standDown}); archiving is left to the primary`);
+    return;
+  }
 
   /** Running total across every session in this process. */
   let totalTokens = 0;
@@ -122,6 +141,14 @@ export function apply(ctx, rawConfig) {
   let batch = 0;
   /** Serializes boundary handling so two sessions never write the same batch. */
   let queue = Promise.resolve();
+  /** Commit the resume point for one session after its report is durable. */
+  const commitCursor = (sessionId, upTo) => {
+    if (upTo === undefined) return;
+    const current = sessionCursor.get(sessionId) ?? 0;
+    if (upTo > current) sessionCursor.set(sessionId, upTo);
+  };
+  /** Per-session index into `ownEvents()` of the first not-yet-archived event. */
+  const sessionCursor = new Map();
   /** Highest ordinal already handed out per output directory. */
   const perDirBatch = new Map();
   /** Monotonic tie-breaker so two notices in the same millisecond still differ. */
@@ -285,12 +312,32 @@ export function apply(ctx, rawConfig) {
    */
   const prepareSummary = async (session) => {
     const agent = agentOf(session);
-    const transcript = buildTranscript(session.ownEvents(), { maxChars: config.maxTranscriptChars });
+    // Incremental by default: only the events produced since the previous
+    // archive of *this* session. Summarizing the whole history again would make
+    // every file a near-copy of the one before it once the interval is small
+    // (at a 256K interval, the fifth file is ~80% identical to the fourth).
+    const events = session.ownEvents();
+    const since = sessionCursor.get(session.id) ?? 0;
+    const fresh = events.slice(since);
+    // Never archive a span with nothing readable in it: if the gate opened on a
+    // turn that produced no new messages, wait for the next one instead of
+    // filing an empty report.
+    const transcript = buildTranscript(fresh, { maxChars: config.maxTranscriptChars });
+    // Nothing new to say: do not file an empty report and do not advance the
+    // cursor (there is nothing to skip past). The caller checks `empty`.
+    if (transcript.text === '' && fresh.length === 0) {
+      return { empty: true, agent, transcript, route: undefined, summaryText: '', summaryFailure: undefined, truncated: false, sessionTitle: titleOf(session) };
+    }
+    // The cursor is NOT advanced here. It may only move once the report is on
+    // disk: consuming the span before the write commits would discard that
+    // conversation segment forever if the model call or the write then failed.
+    // The caller commits it through `commitCursor` on success.
+    const upTo = events.length;
     const route = resolveRoute(config, session, agent);
     const { text: summaryText, failure: summaryFailure, truncated } = await summarize(session, transcript, route);
     // Snapshot the title once so every boundary in this crossing agrees.
     const sessionTitle = titleOf(session);
-    return { agent, transcript, route, summaryText, summaryFailure, truncated, sessionTitle };
+    return { agent, transcript, route, summaryText, summaryFailure, truncated, sessionTitle, upTo };
   };
 
   /**
@@ -300,7 +347,7 @@ export function apply(ctx, rawConfig) {
    * @param shared - inputs from {@link prepareSummary}, reused across boundaries.
    * @returns the written file's name and any failure text.
    */
-  const writeSummary = async (session, boundary, shared) => {
+  const writeSummary = async (session, boundary, shared, startedAt, spanned) => {
     const finishedAt = Date.now();
     const { agent, transcript, route, summaryText, summaryFailure, truncated, sessionTitle } =
       shared ?? (await prepareSummary(session));
@@ -316,7 +363,7 @@ export function apply(ctx, rawConfig) {
       batch: ordinal,
       intervalTokens: config.intervalTokens,
       totalTokens: boundary,
-      startedAt: boundary - config.intervalTokens,
+      startedAt: startedAt ?? boundary - config.intervalTokens,
       finishedAt,
       sessionId: String(session.id),
       sessionTitle,
@@ -327,6 +374,7 @@ export function apply(ctx, rawConfig) {
       failure: summaryFailure,
       truncated,
       transcriptChars: transcript.chars,
+      spanned,
     });
 
     let failure = summaryFailure;
@@ -450,27 +498,42 @@ export function apply(ctx, rawConfig) {
         // boundary here summarizes the same conversation span, so re-asking the
         // model per boundary would pay N times for identical output.
         const shared = boundaries.length > 0 ? await prepareSummary(session) : undefined;
-        for (const boundary of boundaries) {
-          const written = await writeSummary(session, boundary, shared);
-          // Never claim a write that did not happen: the log line and the notice
-          // are the only feedback a user gets, so they must describe the real
-          // outcome.
-          if (written.writeFailed) {
-            logger.error(`第 ${written.ordinal} 批写入失败：${written.failure ?? '未知原因'}`);
-          } else {
-            logger.info(`第 ${written.ordinal} 批已写入 ${written.filePath}`);
-          }
-          notify(session, buildNotice({
-            batch: written.ordinal,
-            intervalTokens: config.intervalTokens,
-            totalTokens: boundary,
-            fileName: written.fileName,
-            failure: written.failure,
-            writeFailed: written.writeFailed,
-          }));
-          // Advance only after this boundary's outcome is settled.
-          if (boundary + config.intervalTokens > nextThreshold) {
-            nextThreshold = boundary + config.intervalTokens;
+        // Nothing new to archive since the previous batch: leave the boundaries
+        // pending so the next turn that does produce content fills them, rather
+        // than filing empty reports or silently skipping the span.
+        if (shared?.empty === true) {
+          logger.debug(`第 ${boundaries[0]} 批：自上次归档后无新内容，推迟到下个批次`);
+          return;
+        }
+        // One crossing produces exactly ONE report, spanning every boundary it
+        // covered. Filing one file per boundary wrote N identical summaries of
+        // the same span — pure duplication: a single 4-boundary crossing used to
+        // produce four files with the same text and four separate notices.
+        const last = boundaries[boundaries.length - 1];
+        const written = await writeSummary(
+          session, last, shared, boundaries[0] - config.intervalTokens, boundaries.length,
+        );
+        if (written.writeFailed) {
+          logger.error(`第 ${written.ordinal} 批写入失败：${written.failure ?? '未知原因'}`);
+        } else {
+          logger.info(`第 ${written.ordinal} 批已写入 ${written.filePath}`);
+        }
+        notify(session, buildNotice({
+          batch: written.ordinal,
+          intervalTokens: config.intervalTokens,
+          totalTokens: last,
+          fileName: written.fileName,
+          failure: written.failure,
+          writeFailed: written.writeFailed,
+          spanned: boundaries.length,
+        }));
+        // Commit both cursors only after the crossing is settled. A failed write
+        // leaves the span unconsumed and the boundary pending, so the next
+        // trigger retries instead of losing the segment.
+        if (!written.writeFailed) {
+          commitCursor(session.id, shared.upTo);
+          if (last + config.intervalTokens > nextThreshold) {
+            nextThreshold = last + config.intervalTokens;
           }
         }
       })

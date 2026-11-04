@@ -26,7 +26,7 @@ const ok = (label, fn) => {
 
 ok('defaults survive an absent config', () => {
   const { config, warnings } = normalizeConfig(undefined);
-  assert.equal(config.intervalTokens, 10_000_000);
+  assert.equal(config.intervalTokens, DEFAULT_CONFIG.intervalTokens);
   assert.equal(config.enabled, true);
   assert.deepEqual(warnings, []);
 });

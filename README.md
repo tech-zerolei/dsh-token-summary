@@ -1,6 +1,6 @@
 # dsh-token-summary
 
-> 每累计 **1000 万 token**，自动把一个 DeepSeek Harness 会话总结成一份 **Markdown** 归档文件。
+> 每累计 **200 万 token**（增量），自动把新增的对话内容总结成一份 **Markdown** 归档文件。
 
 <p align="center">
   <img src="./icon.svg" width="96" alt="dsh-token-summary" />
@@ -52,7 +52,7 @@
 ## 使用场景
 
 ### 1. 长周期任务的自动交接
-一个重构任务跑了几个小时、几百轮工具调用。每跨过 1000 万 token，插件自动生成一份总结——你随时能拿最新那份当交接文档，交给同事或交给第二天的自己。
+一个重构任务跑了几个小时、几百轮工具调用。每跨过 200 万 token，插件自动生成一份总结——你随时能拿最新那份当交接文档，交给同事或交给第二天的自己。
 
 ### 2. 事后复盘与知识沉淀
 一周后想回顾"那次为什么把缓存层换掉"，不用重读对话，直接看归档文件里的「关键决策与原因」一节。
@@ -120,19 +120,37 @@ ctx.on('session/event', (session, event) => {
 
 #### ② 边界锚定在绝对整数倍上
 
-阈值不是"上次归档后再加 1000 万"，而是绝对刻度：`0 → 9,999,999`、`10,000,000 → 19,999,999`……
+阈值不是"上次归档后再加 200 万"，而是绝对刻度：`0 → 1,999,999`、`2,000,000 → 3,999,999`……
 
-这样做的原因：一次响应可能一次跨过多个边界（比如阈值调小用于测试时），或用量的粒度很粗。如果按"上次总量 + 间隔"推进，一次超调会让**之后所有批次永久漂移**。当前实现为每个跨过的边界各出一份报告：
+这样做的原因：一次响应可能一次跨过多个边界（比如阈值调小用于测试时），或用量的粒度很粗。如果按"上次总量 + 间隔"推进，一次超调会让**之后所有批次永久漂移**。
+
+一次触发的所有边界合并成 **一份** 报告，文件里记录「跨越区间数」——而不是每个边界各写一份内容相同的文件（那会产出 N 份雷同归档）：
 
 ```js
 const boundaries = [];
-while (totalTokens >= nextThreshold) {
-  boundaries.push(nextThreshold);
-  nextThreshold += config.intervalTokens;
+let cursor = nextThreshold;
+while (totalTokens >= cursor) {
+  boundaries.push(cursor);
+  cursor += config.intervalTokens;
 }
+// 只写一份，覆盖 boundaries[0] 之前 到 last 之间的区间
 ```
 
-#### ③ 转录预算从尾部向前分配
+#### ③ 增量归档：每份只总结新增的部分
+
+这是让短间隔真正有用的关键。归档时只取「自上次归档之后产生的事件」：
+
+```js
+const events = session.ownEvents();
+const since = sessionCursor.get(session.id) ?? 0;
+const fresh = events.slice(since);      // 只要新增的
+```
+
+如果每次都总结全部历史，阈值一小，第 N 份就会包含前 N-1 份的全部内容——在 256K 间隔下实测第 5 份有 **80% 与第 4 份重复**，归档价值几乎为零。
+
+游标**只在文件写成功后才推进**：摘要调用失败时那一段内容不会被吞掉，下次触发会重试。
+
+#### ④ 转录预算从尾部向前分配
 
 总结的价值集中在"事情最后做成了什么"。所以当历史超过 `maxTranscriptChars` 时，**先丢最早的内容**：
 
@@ -140,15 +158,15 @@ while (totalTokens >= nextThreshold) {
 for (let index = candidates.length - 1; index >= 0; index -= 1) { /* 从最新往回填预算 */ }
 ```
 
-#### ④ 通知用 `inject()` 而不是 `followup()`
+#### ⑤ 通知用 `inject()` 而不是 `followup()`
 
 `agent.inject()` 把消息放进收件箱但**不唤醒**空闲的 agent。这是刻意的：归档是后台行为，不该因为它凭空开一个 turn、多烧一次钱。`followup()` 会唤醒驱动，那就变成了"插件替你说话"。
 
-#### ⑤ 失败也要留下痕迹
+#### ⑥ 失败也要留下痕迹
 
 模型调用失败（无路由 / 上游 502 / 超时）时，**仍然写文件**，正文降级为统计兜底并附上失败原因。理由是：漏掉一个批次的记录，比写一个"这次没摘要成功"的文件更糟——后者至少保住了统计和边界事实。
 
-#### ⑥ 不写任何自有状态到会话日志
+#### ⑦ 不写任何自有状态到会话日志
 
 插件不在 session log 里新增事件类型。原因见 DSH 的约定：读者只在事件带 `ignorable: true` 时才容忍未知类型，而运行时 `append()` 设不了这个标记，写了会导致会话无法重开。所以计数器放在内存里，唯一的日志写入是一条 producer 归属明确的 `user/message` 通知（`kind: 'token-summary'`, `form: 'notice'`）。
 
@@ -192,7 +210,7 @@ pnpm add link:/path/to/dsh-token-summary
     - id: token-summary
       name: 'dsh-token-summary'
       config:
-        intervalTokens: 10000000
+        intervalTokens: 2000000
         outputDir: ''
         notifyInSession: true
         enabled: true
@@ -206,7 +224,7 @@ pnpm add link:/path/to/dsh-token-summary
 
 | 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `intervalTokens` | `10000000` | 一个批次覆盖的 token 数（全局累计） |
+| `intervalTokens` | `2000000` | 一个批次覆盖的 token 数（全局累计） |
 | `outputDir` | `''` | 输出目录；留空则写入 `<会话工作目录>/.dsh-summaries`，填绝对路径则所有会话集中写入该目录 |
 | `provider` | `''` | 摘要用的 provider 路由；**必须与 `model` 同时填写** |
 | `model` | `''` | 摘要用的精确模型 id |
@@ -491,7 +509,7 @@ v1.0.0  ← 首个稳定版：全局累计、模型摘要、Markdown 落盘、�
 2. **归档的是"跨阈值那一刻所在的那个会话"**。全局计数跨会话共享，但每一批次只总结触发它的那个会话，不是所有会话的总和。
 3. **没有 UI 面板**（见上文理由）。
 4. **摘要质量取决于转录预算**。`maxTranscriptChars` 设得过小会丢早期上下文，总结会偏向"最近发生了什么"。
-5. **对每批次都会产生一次模型调用**。阈值设得过小（例如测试用的 60k）会显著增加成本，生产环境应保持默认的 1000 万。
+5. **对每批次都会产生一次模型调用**。阈值设得过小会显著增加成本；默认 200 万的经验值是：模型往返一次通常远小于此，而一次深度开发会话大致归档 1–2 次。
 
 ---
 

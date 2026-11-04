@@ -73,6 +73,17 @@ function makeSession(id, cwd) {
     id,
     header: { cwd },
     ownEvents: () => events,
+    /**
+     * Append a fresh exchange, the way a real conversation grows between two
+     * threshold crossings. Archiving is incremental, so a crossing with no new
+     * events correctly files nothing; tests that expect a second batch must add
+     * content first.
+     */
+    appendTurn: (text) => {
+      const seq = events.length + 1;
+      events.push({ type: 'user/message', seq, time: seq, data: { content: [{ type: 'text', text }] } });
+      events.push({ type: 'assistant/message', seq: seq + 1, time: seq + 1, data: { message: { content: [{ type: 'text', text: `回应：${text}` }] }, usage: { totalTokens: 10 } } });
+    },
     requestHeader: () => ({ config: { provider: 'dp', model: 'deepseek-v4.1-flash-1017' } }),
   };
 }
@@ -126,6 +137,7 @@ assert.match(index, /第 1 批/);
 assert.ok(index.includes(batchFile), 'index links the batch file');
 
 // A second crossing writes a second, separately named batch and appends to the index.
+session.appendTurn('第二轮的进展：插件已能落盘。');
 host.emit({ type: 'assistant/message', data: { usage: { totalTokens: 120 } } }, session);
 await new Promise((r) => setTimeout(r, 150));
 const files2 = await readdir(outdir);
@@ -149,12 +161,11 @@ const failDir = join(outdir, 'fail');
 apply(failing.ctx, { intervalTokens: 10, outputDir: failDir, notifyInSession: true });
 failing.emit({ type: 'assistant/message', data: { usage: { totalTokens: 25 } } }, session2);
 await new Promise((r) => setTimeout(r, 150));
-// 25 tokens cross both the 10 and the 20 boundary, so one report is filed per
-// boundary instead of a single shifted batch.
+// 25 tokens cross both the 10 and the 20 boundary. One crossing files exactly
+// ONE report spanning both, recording the span in its range and 跨越区间数.
 const failFiles = (await readdir(failDir)).filter((f) => f.startsWith('summary-'));
-assert.equal(failFiles.length, 2, `one report per boundary, got ${failFiles.join(', ')}`);
-const failFile = failFiles.find((f) => /^summary-\d{4}-10-/.test(f));
-assert.ok(failFile, `the batch for the 10 boundary exists, got ${failFiles.join(', ')}`);
+assert.equal(failFiles.length, 1, `one crossing, one report, got ${failFiles.join(', ')}`);
+const failFile = failFiles[0];
 const failMd = await readFile(join(failDir, failFile), 'utf8');
 assert.match(failMd, /摘要模型调用失败/);
 assert.match(failMd, /上游 502/);
@@ -199,6 +210,30 @@ assert.equal(sharedFiles.length, 2, `both instances filed, got ${sharedFiles.joi
 assert.match(sharedFiles[0], /^summary-0001-/, 'first file keeps batch 1');
 assert.match(sharedFiles[1], /^summary-0002-/, `second instance must not reuse batch 1, got ${sharedFiles[1]}`);
 
+// Regression: archiving is INCREMENTAL. Each batch must summarize only the span
+// produced since the previous batch. Re-summarizing the whole history made every
+// file a near-copy of the last (at a 256K interval the fifth file was ~80%
+// identical to the fourth).
+const incDir = join(outdir, 'incremental');
+const inc = makeContext();
+inc.injectedAgents.push({ id: 'session-inc', inject: () => {} });
+const incSession = makeSession('session-inc', outdir);
+apply(inc.ctx, { intervalTokens: 10, outputDir: incDir, notifyInSession: false });
+for (const [round, text] of [[1, '第一轮独有的内容'], [2, '第二轮独有的内容'], [3, '第三轮独有的内容']]) {
+  incSession.appendTurn(text);
+  inc.emit({ type: 'assistant/message', data: { usage: { totalTokens: 15 } } }, incSession);
+  await new Promise((r) => setTimeout(r, 150));
+}
+assert.equal(inc.llmCalls.length, 3, `three crossings, three model calls, got ${inc.llmCalls.length}`);
+for (const [index, own] of ['第一轮独有的内容', '第二轮独有的内容', '第三轮独有的内容'].entries()) {
+  const prompt = inc.llmCalls[index].messages[0].content[0].text;
+  assert.ok(prompt.includes(own), `batch ${index + 1} must contain its own span`);
+  // Only batch 1 sees the session's opening event; later batches must not repeat it.
+  if (index > 0) {
+    assert.ok(!prompt.includes('给我做一个 token 总结插件'), `batch ${index + 1} must not re-send the whole history`);
+  }
+}
+
 // Regression: a boundary must survive a failure inside writeSummary. The old
 // code advanced the threshold cursor before the write committed, so one throw
 // silently consumed the boundary and the next crossing jumped past it.
@@ -217,12 +252,20 @@ apply(lost.ctx, { intervalTokens: 10, outputDir: failDir2, notifyInSession: fals
 lost.emit({ type: 'assistant/message', data: { usage: { totalTokens: 15 } } }, lostSession); // boundary 10
 await new Promise((r) => setTimeout(r, 150));
 // The failure must not have burned boundary 10: the next crossing retries it.
+// Both the span 0-9 (whose archive failed) and the events arriving in between
+// are still unconsumed, so the retry covers everything up to boundary 30.
 lost.emit({ type: 'assistant/message', data: { usage: { totalTokens: 15 } } }, lostSession); // total 30
 await new Promise((r) => setTimeout(r, 250));
 const lossFiles = (await readdir(failDir2)).filter((f) => f.startsWith('summary-')).sort();
-const lossBoundaries = lossFiles.map((f) => f.split('-')[2]);
-assert.ok(lossBoundaries.includes('10'), `boundary 10 must be retried, got ${lossFiles.join(', ')}`);
-assert.ok(lossBoundaries.includes('20'), `boundary 20 must also be filed, got ${lossFiles.join(', ')}`);
+assert.equal(lossFiles.length, 1, `the retry files one report, got ${lossFiles.join(', ')}`);
+// It must cover all three pending boundaries, proving 10 was not skipped.
+assert.match(lossFiles[0], /-30-/, `the retry must span up to boundary 30, got ${lossFiles[0]}`);
+const retryMd = await readFile(join(failDir2, lossFiles[0]), 'utf8');
+assert.match(retryMd, /\| 跨越区间数 \| 3 \|/, 'the retry records the three intervals it caught up on');
+// The archived transcript is what was SENT to the model (the file holds the
+// model's summary, not the raw conversation).
+const retryPrompt = lost.llmCalls.at(-1).messages[0].content[0].text;
+assert.match(retryPrompt, /hi/, 'the retry re-sends the unconsumed span to the model');
 
 // Regression: a multi-boundary crossing summarizes once, not once per boundary.
 const multiDir = join(outdir, 'multi');
@@ -232,8 +275,12 @@ apply(multi.ctx, { intervalTokens: 10, outputDir: multiDir, notifyInSession: fal
 multi.emit({ type: 'assistant/message', data: { usage: { totalTokens: 35 } } }, makeSession('session-multi', outdir));
 await new Promise((r) => setTimeout(r, 400));
 const multiFiles = (await readdir(multiDir)).filter((f) => f.startsWith('summary-'));
-assert.equal(multiFiles.length, 3, `three boundaries, three files, got ${multiFiles.join(', ')}`);
+// 35 tokens cross the 10/20/30 boundaries at once: one file covering all three,
+// and exactly one model call for the single transcript.
+assert.equal(multiFiles.length, 1, `one crossing, one report, got ${multiFiles.join(', ')}`);
 assert.equal(multi.llmCalls.length, 1, `one transcript means one model call, got ${multi.llmCalls.length}`);
+const multiMd = await readFile(join(multiDir, multiFiles[0]), 'utf8');
+assert.match(multiMd, /\| 跨越区间数 \| 3 \|/, 'the file records how many intervals it spans');
 
 // Regression: sequential instances are not enough. Two instances that fire at
 // the *same* instant race between reading the directory and writing the file

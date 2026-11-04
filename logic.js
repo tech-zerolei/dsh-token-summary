@@ -11,7 +11,7 @@
 /** Default runtime configuration. Every field is optional in `cordis.patch.yml`. */
 export const DEFAULT_CONFIG = Object.freeze({
   /** Token budget of one summary batch. Crossing it produces one Markdown file. */
-  intervalTokens: 10_000_000,
+  intervalTokens: 2_000_000,
   /** Absolute output directory; empty selects `<session cwd>/.dsh-summaries`. */
   outputDir: '',
   /** Provider route override; must be given together with `model`. */
@@ -26,6 +26,12 @@ export const DEFAULT_CONFIG = Object.freeze({
   timeoutMs: 180_000,
   /** Whether to leave a durable notice in the session that crossed the batch. */
   notifyInSession: true,
+  /**
+   * Comma-separated env vars that mark this Host as a secondary Harness process.
+   * When any is set the plugin stands down, because another process is already
+   * counting and archiving the same conversations.
+   */
+  standDownEnv: 'DSH_PHONE_AS_MINTER',
   /** Master switch. */
   enabled: true,
 });
@@ -58,6 +64,7 @@ export function normalizeConfig(config) {
       maxSummaryOutputTokens: positiveInteger(raw.maxSummaryOutputTokens, DEFAULT_CONFIG.maxSummaryOutputTokens),
       maxTranscriptChars: positiveInteger(raw.maxTranscriptChars, DEFAULT_CONFIG.maxTranscriptChars),
       timeoutMs: positiveInteger(raw.timeoutMs, DEFAULT_CONFIG.timeoutMs),
+      standDownEnv: typeof raw.standDownEnv === 'string' ? raw.standDownEnv.trim() : DEFAULT_CONFIG.standDownEnv,
       notifyInSession: raw.notifyInSession !== false,
       enabled: raw.enabled !== false,
     },
@@ -270,6 +277,7 @@ export function renderMarkdown(input) {
     failure,
     truncated,
     transcriptChars,
+    spanned,
   } = input;
   const rows = [
     ['生成时间', new Date(finishedAt).toISOString()],
@@ -278,6 +286,7 @@ export function renderMarkdown(input) {
     ['工作目录', cwd === undefined || cwd === '' ? '（无）' : `\`${cwd}\``],
     ['本批序号', `第 ${batch} 批`],
     ['本批区间', `${formatNumber(startedAt)} → ${formatNumber(totalTokens - 1)} token`],
+    ['跨越区间数', String(spanned ?? 1)],
     ['批大小', `${formatNumber(intervalTokens)} token`],
     ['累计 token', formatNumber(totalTokens)],
     ['摘要模型', route === undefined ? '（未解析）' : `${route.provider} / ${route.model}`],
@@ -341,11 +350,15 @@ export function buildNotice(input) {
     head = `每 ${formatNumber(input.intervalTokens)} token 归档：第 ${input.batch} 批写入失败`;
     tail = '（未生成文件，详见日志）';
   } else if (input.failure === undefined) {
+    // `spanned` > 1 means one crossing covered several intervals at once; say so
+    // instead of pretending the batch was a single interval.
+    const span = input.spanned !== undefined && input.spanned > 1 ? `，覆盖 ${input.spanned} 个区间` : '';
     head = `每 ${formatNumber(input.intervalTokens)} token 归档：第 ${input.batch} 批总结已写入 ${input.fileName}`;
-    tail = `（累计 ${formatNumber(input.totalTokens)} token）`;
+    tail = `（累计 ${formatNumber(input.totalTokens)} token${span}）`;
   } else {
+    const span = input.spanned !== undefined && input.spanned > 1 ? `，覆盖 ${input.spanned} 个区间` : '';
     head = `每 ${formatNumber(input.intervalTokens)} token 归档：第 ${input.batch} 批已写入 ${input.fileName}`;
-    tail = '（摘要模型调用失败，文件内为统计兜底）';
+    tail = `（摘要模型调用失败，文件内为统计兜底${span}）`;
   }
   const text = `${head}${tail}`;
   const points = [...text];

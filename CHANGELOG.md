@@ -9,6 +9,36 @@
 
 <!-- 下一次发布前把内容归入新的版本小节 -->
 
+## [1.1.0] - 2026-11-04
+
+让较短的归档间隔真正可用。此前把 `intervalTokens` 调小（如 256K）会瞬间产出
+大量近乎重复的垃圾文件：实测 54 份里后 5 份只有 74–296 字符。
+
+### Added
+
+- **增量归档**：每份只总结「自上次归档之后产生的事件」，不再重复总结全部历史。
+  在此之前，阈值一调小，第 N 份就包含前 N-1 份的全部内容——在 256K 间隔下单次实测
+  第 5 份有 **80% 与第 4 份重复**，归档价值几乎为零。
+- **次级进程停摆**：一台机器可能同时跑两个 Harness 进程（`dsh-phone-remote` 会拉起
+  一个带 `DSH_PHONE_AS_MINTER` 标记的 cookie minter），两者各自累计 token 会为每个
+  批次写出**两份**归档。插件现在识别该标记并主动停摆，把归档留给主进程。
+  标记列表可通过 `standDownEnv` 配置，适配其他双进程场景。
+- `standby-check.mjs`：用真实子进程验证「次级停摆、主进程正常归档」。
+
+### Changed
+
+- **默认阈值 1000 万 → 200 万**。依据实际会话规模：本机真实转录为 8K–82K 字符
+  （中位 25K），而 256K token 约等于 655K 字符，远超单次会话长度，实际永远够不到；
+  200 万对应一次深度开发会话大致归档 1–2 次。
+
+### Fixed
+
+- **一次触发写 N 份重复文件**：跨 N 个边界时原先写 N 份内容相同的归档。
+  现在合并为**一份**，文件内记录「跨越区间数」，通知也标明覆盖了几个区间。
+- **游标推进过早**：增量游标曾在摘要调用前就推进，导致调用失败时那段对话被永久丢弃。
+  现在**只在文件写成功后才提交游标**，失败时下次触发会重试该段内容。
+- **空内容归档**：自上次归档后若无新对话，不再产出空壳文件，边界保留到下次触发。
+
 ## [1.0.3] - 2026-11-04
 
 第二轮审计（独立代码审查）发现的 P1/P2 问题，全部已复现并修复。
@@ -167,7 +197,8 @@
   因此计数器保存在内存中，随进程重启归零。
 - v1.0.0 不含 UI 面板：归档产物是文件，需求本体在文件上，面板收益低于维护成本。
 
-[Unreleased]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.0.0...v1.0.1

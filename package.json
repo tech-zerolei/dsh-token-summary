@@ -1,6 +1,6 @@
 {
   "name": "dsh-token-summary",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "每累计 1000 万 token 自动把一个 DeepSeek Harness 会话总结成一份 Markdown 归档文件（全局计数、模型摘要、落盘与通知）",
   "type": "module",
   "main": "index.js",
@@ -22,7 +22,8 @@
     "selftest.mjs",
     "e2e.mjs",
     "persist-check.mjs",
-    "concurrency-check.mjs"
+    "concurrency-check.mjs",
+    "standby-check.mjs"
   ],
   "dsh": {
     "bundle": {
@@ -30,11 +31,12 @@
     }
   },
   "scripts": {
-    "test": "node selftest.mjs && node e2e.mjs && node persist-check.mjs && node concurrency-check.mjs",
+    "test": "node selftest.mjs && node e2e.mjs && node persist-check.mjs && node concurrency-check.mjs && node standby-check.mjs",
     "test:logic": "node selftest.mjs",
     "test:e2e": "node e2e.mjs",
     "test:persist": "node persist-check.mjs",
-    "test:concurrency": "node concurrency-check.mjs"
+    "test:concurrency": "node concurrency-check.mjs",
+    "test:standby": "node standby-check.mjs"
   },
   "keywords": [
     "dsh",

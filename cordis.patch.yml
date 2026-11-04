@@ -4,7 +4,7 @@
     - id: token-summary
       name: 'dsh-token-summary'
       config:
-        intervalTokens: 10000000
+        intervalTokens: 2000000
         outputDir: ''
         maxSummaryOutputTokens: 2048
         maxTranscriptChars: 120000
