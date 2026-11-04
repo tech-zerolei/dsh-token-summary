@@ -172,5 +172,28 @@ assert.equal(unroutedFiles.length, 1, `one report, got ${unroutedFiles.join(', '
 const unroutedReport = await readFile(join(unroutedDir, unroutedFiles[0]), 'utf8');
 assert.match(unroutedReport, /无法确定摘要路由/);
 
+// Regression: two independent plugin instances (two Host processes, or a
+// restart) writing the same directory must not both file "第 1 批". The ordinal
+// is derived from the archive, not from each process's private counter.
+const sharedDir = join(outdir, 'shared');
+const first = makeContext();
+const firstSession = makeSession('session-shared', outdir);
+first.injectedAgents.push({ id: 'session-shared', inject: () => {} });
+apply(first.ctx, { intervalTokens: 10, outputDir: sharedDir, notifyInSession: false });
+first.emit({ type: 'assistant/message', data: { usage: { totalTokens: 15 } } }, firstSession);
+await new Promise((r) => setTimeout(r, 120));
+
+const second = makeContext();
+const secondSession = makeSession('session-shared', outdir);
+second.injectedAgents.push({ id: 'session-shared', inject: () => {} });
+apply(second.ctx, { intervalTokens: 10, outputDir: sharedDir, notifyInSession: false });
+second.emit({ type: 'assistant/message', data: { usage: { totalTokens: 15 } } }, secondSession);
+await new Promise((r) => setTimeout(r, 120));
+
+const sharedFiles = (await readdir(sharedDir)).filter((f) => f.startsWith('summary-')).sort();
+assert.equal(sharedFiles.length, 2, `both instances filed, got ${sharedFiles.join(', ')}`);
+assert.match(sharedFiles[0], /^summary-0001-/, 'first file keeps batch 1');
+assert.match(sharedFiles[1], /^summary-0002-/, `second instance must not reuse batch 1, got ${sharedFiles[1]}`);
+
 await rm(outdir, { recursive: true, force: true });
 console.log('e2e: all checks passed');

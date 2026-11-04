@@ -19,7 +19,7 @@
  * @module dsh-token-summary
  */
 
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import {
   buildNotice,
@@ -194,14 +194,40 @@ export function apply(ctx, rawConfig) {
   };
 
   /**
+   * Decide the next batch ordinal from what is already on disk.
+   *
+   * The in-memory counter cannot be trusted as the only source: several Host
+   * processes (or a restart) each start from zero, and two of them would
+   * otherwise both write "第 1 批". Scanning the directory makes the ordinal a
+   * property of the archive, so numbering stays monotonic across processes.
+   *
+   * @param dir - output directory that will receive the batch file.
+   * @returns the next free ordinal, at least `batch + 1`.
+   */
+  const nextOrdinal = async (dir) => {
+    batch += 1;
+    let highest = batch - 1;
+    try {
+      for (const entry of await readdir(dir)) {
+        const match = /^summary-(\d+)-/.exec(entry);
+        if (match === null) continue;
+        const seen = Number(match[1]);
+        if (Number.isSafeInteger(seen) && seen > highest) highest = seen;
+      }
+    } catch {
+      // A missing directory simply means no batch has been filed there yet.
+    }
+    batch = highest + 1;
+    return batch;
+  };
+
+  /**
    * Build and write the Markdown deliverable for one completed batch.
    * @param session - session that crossed the threshold.
    * @param boundary - the running total that crossed it.
    * @returns the written file's name and any failure text.
    */
   const writeSummary = async (session, boundary) => {
-    batch += 1;
-    const ordinal = batch;
     const finishedAt = Date.now();
     const agent = agentOf(session);
     const transcript = buildTranscript(session.ownEvents(), { maxChars: config.maxTranscriptChars });
@@ -209,6 +235,9 @@ export function apply(ctx, rawConfig) {
     const { text: summaryText, failure: summaryFailure } = await summarize(session, transcript, route);
 
     const dir = outputDirFor(session, agent);
+    // Ask for the ordinal only after the await above, so two concurrent writers
+    // in this process cannot reserve the same number.
+    const ordinal = await nextOrdinal(dir);
     const stamp = new Date(finishedAt).toISOString().replace(/[:.]/g, '-');
     const fileName = `summary-${String(ordinal).padStart(4, '0')}-${boundary}-${stamp}.md`;
     const filePath = join(dir, fileName);
