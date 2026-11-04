@@ -170,19 +170,31 @@ export function buildTranscript(events, limits) {
   }
 
   // Spend the budget from the most recent line backwards: a summary of a long
-  // span is about where the work ended up, so the oldest turns are the ones to
-  // drop when the span is larger than the transcript budget.
+  // span is about where the work ended up, so older turns are dropped first and
+  // the newest content survives.
   const kept = [];
   let used = 0;
   let dropped = 0;
   for (let index = candidates.length - 1; index >= 0; index -= 1) {
     const line = candidates[index];
-    if (used + line.length > maxChars) {
-      dropped += 1;
+    if (used + line.length <= maxChars) {
+      used += line.length;
+      kept.push(line);
       continue;
     }
-    used += line.length;
-    kept.push(line);
+    // Over budget. Dropping the whole line is what made a small
+    // `maxTranscriptChars` produce an *empty* transcript (the newest message is
+    // often the only one that matters, and a single message can exceed the whole
+    // budget). Clip it to the remaining room instead, so the newest content is
+    // always represented; only genuinely older lines are dropped whole.
+    const room = maxChars - used;
+    if (kept.length === 0 && room > 1) {
+      const points = [...line];
+      const clipped = `${points.slice(0, room - 1).join('')}…`;
+      used += clipped.length;
+      kept.push(clipped);
+    }
+    dropped += 1;
   }
   kept.reverse();
 
@@ -256,6 +268,7 @@ export function renderMarkdown(input) {
     stats,
     summaryText,
     failure,
+    truncated,
     transcriptChars,
   } = input;
   const rows = [
@@ -275,7 +288,11 @@ export function renderMarkdown(input) {
     ['摘要输入字符', formatNumber(transcriptChars)],
   ];
   const table = ['| 项目 | 值 |', '| --- | --- |', ...rows.map(([k, v]) => `| ${tableCell(k)} | ${tableCell(v)} |`)].join('\n');
-  const body = failure === undefined
+  const body = truncated === true && summaryText.trim() !== ''
+    // Truncated but usable: keep the text, and say plainly that it is partial so
+    // nobody mistakes a cut-off summary for a complete one.
+    ? `${summaryText.trim()}\n\n> ⚠️ 该摘要因输出达到 maxSummaryOutputTokens 上限而被截断，内容不完整。`
+    : failure === undefined
     ? summaryText.trim()
     : [
       '> ⚠️ 摘要模型调用失败，以下为统计兜底。原始记录仍在会话日志中，可重新生成。',

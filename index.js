@@ -19,7 +19,7 @@
  * @module dsh-token-summary
  */
 
-import { mkdir, open, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, open, readdir, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import {
   buildNotice,
@@ -47,6 +47,7 @@ export const inject = ['llm'];
 async function collectText(stream) {
   let text = '';
   let failure;
+  let truncated = false;
   for await (const chunk of stream) {
     if (chunk === null || typeof chunk !== 'object') continue;
     if (chunk.type === 'text-delta' && typeof chunk.text === 'string') {
@@ -58,9 +59,16 @@ async function collectText(stream) {
       const reason = chunk.reason;
       if (reason?.kind === 'error') failure = reason.failure?.message ?? '模型返回错误';
       else if (reason?.kind === 'aborted') failure = reason.failure?.message ?? '请求被中止';
+      // `max-tokens` is a legitimate finish reason meaning the output was cut
+      // off mid-sentence. Treating it as success would archive half a summary as
+      // if it were complete, so surface it as a (soft) failure instead.
+      else if (reason?.kind === 'max-tokens') {
+        truncated = true;
+        failure = `摘要输出达到 maxSummaryOutputTokens（${config.maxSummaryOutputTokens}）被截断`;
+      }
     }
   }
-  return { text: text.trim(), failure };
+  return { text: text.trim(), failure, truncated };
 }
 
 /**
@@ -114,6 +122,8 @@ export function apply(ctx, rawConfig) {
   let batch = 0;
   /** Serializes boundary handling so two sessions never write the same batch. */
   let queue = Promise.resolve();
+  /** Highest ordinal already handed out per output directory. */
+  const perDirBatch = new Map();
   /** Monotonic tie-breaker so two notices in the same millisecond still differ. */
   let noticeSeq = 0;
 
@@ -185,11 +195,17 @@ export function apply(ctx, rawConfig) {
         signal: controller.signal,
       });
       const collected = await collectText(stream);
-      if (collected.failure !== undefined) return { text: '', failure: collected.failure };
-      if (collected.text === '') return { text: '', failure: '摘要模型返回了空内容' };
-      return { text: collected.text, failure: undefined };
+      // A truncated answer still carries the beginning of a usable summary, so
+      // keep the text and report the truncation *as well* — dropping it outright
+      // would throw away the only content we managed to generate.
+      if (collected.truncated) {
+        return { text: collected.text, failure: collected.failure, truncated: true };
+      }
+      if (collected.failure !== undefined) return { text: '', failure: collected.failure, truncated: false };
+      if (collected.text === '') return { text: '', failure: '摘要模型返回了空内容', truncated: false };
+      return { text: collected.text, failure: undefined, truncated: false };
     } catch (error) {
-      return { text: '', failure: error instanceof Error ? error.message : String(error) };
+      return { text: '', failure: error instanceof Error ? error.message : String(error), truncated: false };
     } finally {
       clearTimeout(timer);
     }
@@ -213,8 +229,12 @@ export function apply(ctx, rawConfig) {
    * @returns the claimed ordinal and the placeholder path that reserves it.
    */
   const nextOrdinal = async (dir) => {
+    // Per-directory cursor, not a single process-wide counter. `batch` used to
+    // act as a lower bound for *every* directory, so a fresh output directory
+    // (the default layout is one per session cwd) inherited numbering from
+    // unrelated projects and its "第 1 批" title was simply wrong.
+    let candidate = (perDirBatch.get(dir) ?? 0) + 1;
     batch += 1;
-    let candidate = batch;
     // The claim below needs the directory to exist: `open(..., 'wx')` on a
     // missing directory reports ENOENT, which is not a lost race and must not be
     // mistaken for one.
@@ -237,6 +257,7 @@ export function apply(ctx, rawConfig) {
       try {
         const handle = await open(claimPath, 'wx');
         await handle.close();
+        perDirBatch.set(dir, candidate);
         return { ordinal: candidate, claimPath };
       } catch (error) {
         if (error?.code === 'EEXIST') {
@@ -252,17 +273,37 @@ export function apply(ctx, rawConfig) {
   };
 
   /**
-   * Build and write the Markdown deliverable for one completed batch.
-   * @param session - session that crossed the threshold.
-   * @param boundary - the running total that crossed it.
-   * @returns the written file's name and any failure text.
+   * Gather everything a batch report needs, including the model summary.
+   *
+   * Split out from {@link writeSummary} because one threshold crossing can span
+   * several boundaries that all describe the same conversation span: the
+   * transcript and the (paid) model call are shared, while only the rendering
+   * and the file write repeat.
+   *
+   * @param session - session to summarize.
+   * @returns the materialized inputs for one or more batch files.
    */
-  const writeSummary = async (session, boundary) => {
-    const finishedAt = Date.now();
+  const prepareSummary = async (session) => {
     const agent = agentOf(session);
     const transcript = buildTranscript(session.ownEvents(), { maxChars: config.maxTranscriptChars });
     const route = resolveRoute(config, session, agent);
-    const { text: summaryText, failure: summaryFailure } = await summarize(session, transcript, route);
+    const { text: summaryText, failure: summaryFailure, truncated } = await summarize(session, transcript, route);
+    // Snapshot the title once so every boundary in this crossing agrees.
+    const sessionTitle = titleOf(session);
+    return { agent, transcript, route, summaryText, summaryFailure, truncated, sessionTitle };
+  };
+
+  /**
+   * Render and write the Markdown deliverable for one completed batch.
+   * @param session - session that crossed the threshold.
+   * @param boundary - the running total that crossed it.
+   * @param shared - inputs from {@link prepareSummary}, reused across boundaries.
+   * @returns the written file's name and any failure text.
+   */
+  const writeSummary = async (session, boundary, shared) => {
+    const finishedAt = Date.now();
+    const { agent, transcript, route, summaryText, summaryFailure, truncated, sessionTitle } =
+      shared ?? (await prepareSummary(session));
 
     const dir = outputDirFor(session, agent);
     // Claim the ordinal only after the await above, so two concurrent writers
@@ -278,12 +319,13 @@ export function apply(ctx, rawConfig) {
       startedAt: boundary - config.intervalTokens,
       finishedAt,
       sessionId: String(session.id),
-      sessionTitle: titleOf(session),
+      sessionTitle,
       cwd: session.header.cwd ?? agent?.session?.header?.cwd,
       route,
       stats: transcript,
       summaryText,
       failure: summaryFailure,
+      truncated,
       transcriptChars: transcript.chars,
     });
 
@@ -306,14 +348,21 @@ export function apply(ctx, rawConfig) {
         finishedAt,
       });
       try {
-        // `a+` creates the file when absent; the header must only lead the very
-        // first entry, so its presence is measured rather than assumed.
-        const existing = await readFile(index, 'utf8').catch(() => undefined);
-        await writeFile(
-          index,
-          existing === undefined ? `${indexHeader(dir)}${entry}\n` : `${existing}${entry}\n`,
-          'utf8',
-        );
+        // Append-only, never read-modify-write. Rewriting the whole file meant
+        // two concurrent writers read the same text and the later one silently
+        // dropped the other's entry — the index lost rows and, when it did not
+        // exist yet, both writers believed themselves first and clobbered the
+        // header. A single small `appendFile` is atomic enough to avoid both.
+        const headerMarker = join(dir, '.index-header');
+        try {
+          const handle = await open(headerMarker, 'wx');
+          await handle.close();
+          await appendFile(index, `${indexHeader(dir)}\n`, 'utf8');
+        } catch (error) {
+          // EEXIST: the header already exists, which is the normal case.
+          if (error?.code !== 'EEXIST') throw error;
+        }
+        await appendFile(index, `${entry}\n`, 'utf8');
       } catch {
         // ignore: index maintenance is best-effort
       }
@@ -382,15 +431,27 @@ export function apply(ctx, rawConfig) {
     // Boundaries are absolute multiples of the batch size, so a session that
     // overshoots cannot shift every later batch. A single call may cross more
     // than one boundary, so one report is filed per boundary crossed.
+    //
+    // The threshold cursor is NOT advanced here. Doing so before the write
+    // commits would let any failure inside `writeSummary` (a throwing
+    // transcript read, a render error, a disk fault) silently consume the
+    // boundary: the next crossing would jump past it and that archive would be
+    // lost with nothing but a log line. Boundaries stay pending until their
+    // report is durably written, then the cursor advances.
     const boundaries = [];
-    while (totalTokens >= nextThreshold) {
-      boundaries.push(nextThreshold);
-      nextThreshold += config.intervalTokens;
+    let cursor = nextThreshold;
+    while (totalTokens >= cursor) {
+      boundaries.push(cursor);
+      cursor += config.intervalTokens;
     }
     queue = queue
       .then(async () => {
+        // One transcript and one model call for the whole crossing: every
+        // boundary here summarizes the same conversation span, so re-asking the
+        // model per boundary would pay N times for identical output.
+        const shared = boundaries.length > 0 ? await prepareSummary(session) : undefined;
         for (const boundary of boundaries) {
-          const written = await writeSummary(session, boundary);
+          const written = await writeSummary(session, boundary, shared);
           // Never claim a write that did not happen: the log line and the notice
           // are the only feedback a user gets, so they must describe the real
           // outcome.
@@ -407,6 +468,10 @@ export function apply(ctx, rawConfig) {
             failure: written.failure,
             writeFailed: written.writeFailed,
           }));
+          // Advance only after this boundary's outcome is settled.
+          if (boundary + config.intervalTokens > nextThreshold) {
+            nextThreshold = boundary + config.intervalTokens;
+          }
         }
       })
       .catch((error) => {

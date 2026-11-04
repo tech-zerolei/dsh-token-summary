@@ -1,6 +1,6 @@
 {
   "name": "dsh-token-summary",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "每累计 1000 万 token 自动把一个 DeepSeek Harness 会话总结成一份 Markdown 归档文件（全局计数、模型摘要、落盘与通知）",
   "type": "module",
   "main": "index.js",
@@ -15,7 +15,14 @@
     "logic.js",
     "cordis.patch.yml",
     "locale/*.json",
-    "icon.svg"
+    "icon.svg",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "selftest.mjs",
+    "e2e.mjs",
+    "persist-check.mjs",
+    "concurrency-check.mjs"
   ],
   "dsh": {
     "bundle": {

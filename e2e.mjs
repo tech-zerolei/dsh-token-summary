@@ -199,6 +199,42 @@ assert.equal(sharedFiles.length, 2, `both instances filed, got ${sharedFiles.joi
 assert.match(sharedFiles[0], /^summary-0001-/, 'first file keeps batch 1');
 assert.match(sharedFiles[1], /^summary-0002-/, `second instance must not reuse batch 1, got ${sharedFiles[1]}`);
 
+// Regression: a boundary must survive a failure inside writeSummary. The old
+// code advanced the threshold cursor before the write committed, so one throw
+// silently consumed the boundary and the next crossing jumped past it.
+const failDir2 = join(outdir, 'boundary-loss');
+const lost = makeContext();
+lost.injectedAgents.push({ id: 'session-lost', inject: () => {} });
+const lostSession = makeSession('session-lost', outdir);
+// Make the transcript read throw, which happens outside writeSummary's own try.
+let calls = 0;
+lostSession.ownEvents = () => {
+  calls += 1;
+  if (calls === 1) throw new Error('transcript read exploded');
+  return [{ type: 'user/message', data: { content: [{ type: 'text', text: 'hi' }] } }];
+};
+apply(lost.ctx, { intervalTokens: 10, outputDir: failDir2, notifyInSession: false });
+lost.emit({ type: 'assistant/message', data: { usage: { totalTokens: 15 } } }, lostSession); // boundary 10
+await new Promise((r) => setTimeout(r, 150));
+// The failure must not have burned boundary 10: the next crossing retries it.
+lost.emit({ type: 'assistant/message', data: { usage: { totalTokens: 15 } } }, lostSession); // total 30
+await new Promise((r) => setTimeout(r, 250));
+const lossFiles = (await readdir(failDir2)).filter((f) => f.startsWith('summary-')).sort();
+const lossBoundaries = lossFiles.map((f) => f.split('-')[2]);
+assert.ok(lossBoundaries.includes('10'), `boundary 10 must be retried, got ${lossFiles.join(', ')}`);
+assert.ok(lossBoundaries.includes('20'), `boundary 20 must also be filed, got ${lossFiles.join(', ')}`);
+
+// Regression: a multi-boundary crossing summarizes once, not once per boundary.
+const multiDir = join(outdir, 'multi');
+const multi = makeContext();
+multi.injectedAgents.push({ id: 'session-multi', inject: () => {} });
+apply(multi.ctx, { intervalTokens: 10, outputDir: multiDir, notifyInSession: false });
+multi.emit({ type: 'assistant/message', data: { usage: { totalTokens: 35 } } }, makeSession('session-multi', outdir));
+await new Promise((r) => setTimeout(r, 400));
+const multiFiles = (await readdir(multiDir)).filter((f) => f.startsWith('summary-'));
+assert.equal(multiFiles.length, 3, `three boundaries, three files, got ${multiFiles.join(', ')}`);
+assert.equal(multi.llmCalls.length, 1, `one transcript means one model call, got ${multi.llmCalls.length}`);
+
 // Regression: sequential instances are not enough. Two instances that fire at
 // the *same* instant race between reading the directory and writing the file
 // (TOCTOU); before the atomic claim every loser silently overwrote a winner, so

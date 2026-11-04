@@ -112,6 +112,19 @@ ok('an undersized budget drops the oldest lines first', () => {
   assert.doesNotMatch(result.text, /帮我写一个插件/);
 });
 
+ok('an oversized message is clipped, not dropped, so the transcript is never empty', () => {
+  // A single message can exceed the whole budget. Dropping it produced an empty
+  // transcript and a summary built on nothing at all.
+  const big = { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'x'.repeat(9000) }] } } };
+  const old = { type: 'user/message', data: { content: [{ type: 'text', text: 'OLDEST' }] } };
+  for (const maxChars of [3000, 4000, 5000]) {
+    const r = buildTranscript([old, big], { maxChars });
+    assert.ok(r.text !== '', `maxChars=${maxChars} must not yield an empty transcript`);
+    assert.ok(r.chars <= maxChars, `maxChars=${maxChars} must stay within budget, got ${r.chars}`);
+    assert.ok(r.text.includes('x'), 'the newest line must survive');
+  }
+});
+
 ok('the prompt frames the transcript', () => {
   const prompt = buildPrompt('会话文本');
   assert.match(prompt, /会话归档员/);
