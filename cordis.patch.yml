@@ -6,7 +6,7 @@
       config:
         intervalTokens: 500000
         outputDir: ''
-        maxSummaryOutputTokens: 8192
+        maxSummaryOutputTokens: 16384
         reasoningEffort: low
         maxTranscriptChars: 400000
         notifyInSession: true

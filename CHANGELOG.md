@@ -9,6 +9,15 @@
 
 <!-- 下一次发布前把内容归入新的版本小节 -->
 
+## [2.0.1] - 2026-11-05
+
+### Fixed
+
+- **长会话下交接文档被截断成空壳**：推理模型的隐藏 reasoning token 与正文共用
+  `maxSummaryOutputTokens` 预算。用本仓库的真实开发日志（6,274 个事件 / 17.6 万字符
+  转录）实测：`max_output_tokens: 8192` 只返回 **735 字符、0 个章节**（完全失效），
+  而 `16384` 返回 **14,258 字符、9 节齐全**。默认值提升到 16384 并加回归测试锁住。
+
 ## [2.0.0] - 2026-11-05
 
 从「分片归档」改为「可交接的长文档」。这是一次破坏性变更：计量口径、文件命名、
@@ -249,7 +258,8 @@
   因此计数器保存在内存中，随进程重启归零。
 - v1.0.0 不含 UI 面板：归档产物是文件，需求本体在文件上，面板收益低于维护成本。
 
-[Unreleased]: https://github.com/tech-zerolei/dsh-token-summary/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/tech-zerolei/dsh-token-summary/compare/v2.0.1...HEAD
+[2.0.1]: https://github.com/tech-zerolei/dsh-token-summary/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.1.0...v2.0.0
 [1.1.0]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/tech-zerolei/dsh-token-summary/compare/v1.0.2...v1.0.3

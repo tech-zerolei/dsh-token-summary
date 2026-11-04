@@ -77,6 +77,15 @@ ok('table cells escape pipes and fold newlines', () => {
   assert.equal(tableCell('a\r\nb'), 'a b');
 });
 
+ok('the default output budget leaves room for a nine-section document', () => {
+  // Reasoning models spend hidden reasoning tokens out of the SAME output budget.
+  // Measured on a 176K-char real transcript: max_output_tokens=8192 produced a
+  // 735-char reply with ZERO sections; 16384 produced all nine. The default must
+  // stay above the point where a long transcript still yields a full document.
+  assert.ok(DEFAULT_CONFIG.maxSummaryOutputTokens >= 16384,
+    `default maxSummaryOutputTokens is ${DEFAULT_CONFIG.maxSummaryOutputTokens}, too small for a full handoff`);
+});
+
 ok('the notice distinguishes write failure from summary failure', () => {
   const base = { batch: 1, intervalTokens: 100, totalTokens: 100, fileName: 'x.md' };
   assert.match(buildNotice(base), /交接文档已更新/);

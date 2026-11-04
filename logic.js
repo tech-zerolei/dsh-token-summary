@@ -19,7 +19,7 @@ export const DEFAULT_CONFIG = Object.freeze({
   /** Exact model id override; must be given together with `provider`. */
   model: '',
   /** Provider generation cap for the summary call. */
-  maxSummaryOutputTokens: 8192,
+  maxSummaryOutputTokens: 16_384,
   /** UTF-8 character ceiling for the replayed transcript handed to the model. */
   maxTranscriptChars: 400_000,
   /** End-to-end deadline for one summary request. */
